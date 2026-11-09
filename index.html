@@ -238,6 +238,7 @@
 })(typeof window !== 'undefined' ? window : globalThis);
 </script>
 <script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-audio@1.2.2/audio_bundle.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js" crossorigin="anonymous"></script>
 <script>
 (function () {
   'use strict';
@@ -318,7 +319,7 @@
   let settings = null, classifier = null, stream = null, ctx = null, proc = null, source = null;
   let engine = null, keeper = null, sessionId = null, running = false;
   let hold = new BurstHold(0);
-  let recorder = null, recStart = 0, recChunks = [], rotateTimer = null, beatTimer = null, wakeLock = null;
+  let mp3 = null, rotateTimer = null, beatTimer = null, wakeLock = null;
   let currentEpisodeId = null;
   const today = { key: dayKey(Date.now()), ep: 0, sus: 0, min: 0 };
   const recent = [];
@@ -384,7 +385,7 @@
       clipsWaiting++; showQueue();
       clipChain = clipChain.then(async () => {
         const name = episodeId + '_' + String(i + 1).padStart(2, '0') + '_' +
-          new Date(seg.start).toTimeString().slice(0, 8).replace(/:/g, '') + '.webm';
+          new Date(seg.start).toTimeString().slice(0, 8).replace(/:/g, '') + (/mpeg/.test(seg.blob.type) ? '.mp3' : '.webm');
         const b64 = await blobToBase64(seg.blob);
         for (let attempt = 1; attempt <= 3; attempt++) {
           try { await run('saveClip', episodeId, name, b64, seg.blob.type || 'audio/webm'); break; }
@@ -412,32 +413,33 @@
     });
   }
 
-  /* ------------------------------------------------------- 1-minute recorder */
-  function pickMime() {
-    const opts = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4'];
-    for (const m of opts) if (window.MediaRecorder && MediaRecorder.isTypeSupported(m)) return m;
-    return '';
-  }
+  /* ------------------------------------------------------- 1-minute recorder (MP3) */
+  // Audio is encoded to MP3 from the same samples the detector hears, one file per minute.
+  // MP3 plays everywhere (iPhone, Windows, email), unlike Chrome's WebM recordings.
   function startSegment() {
-    const mime = pickMime();
-    recChunks = [];
-    recorder = new MediaRecorder(stream, mime ? { mimeType: mime, audioBitsPerSecond: 32000 } : undefined);
-    recStart = Date.now();
-    recorder.ondataavailable = (e) => { if (e.data && e.data.size) recChunks.push(e.data); };
-    recorder.start();
+    mp3 = { enc: new lamejs.Mp3Encoder(1, ctx.sampleRate, 32), chunks: [], start: Date.now() };
+  }
+  function encodePcm(f32) {
+    if (!mp3) return;
+    const i16 = new Int16Array(f32.length);
+    for (let i = 0; i < f32.length; i++) {
+      const v = Math.max(-1, Math.min(1, f32[i]));
+      i16[i] = v < 0 ? v * 0x8000 : v * 0x7fff;
+    }
+    const out = mp3.enc.encodeBuffer(i16);
+    if (out.length) mp3.chunks.push(new Uint8Array(out.buffer, out.byteOffset, out.length));
   }
   /** Finishes the current minute of audio, hands it to the ClipKeeper, starts the next. */
   function rotateSegment(restart) {
-    return new Promise((resolve) => {
-      if (!recorder || recorder.state === 'inactive') { if (restart && running) startSegment(); return resolve(); }
-      const rec = recorder, start = recStart, chunks = recChunks;
-      rec.onstop = () => {
-        if (chunks.length) keeper.add({ start: start, end: Date.now(), blob: new Blob(chunks, { type: rec.mimeType || 'audio/webm' }) });
-        resolve();
-      };
-      rec.stop();
-      if (restart && running) startSegment();
-    });
+    const seg = mp3;
+    mp3 = null;
+    if (seg) {
+      const tail = seg.enc.flush();
+      if (tail.length) seg.chunks.push(new Uint8Array(tail.buffer, tail.byteOffset, tail.length));
+      if (seg.chunks.length) keeper.add({ start: seg.start, end: Date.now(), blob: new Blob(seg.chunks, { type: 'audio/mpeg' }) });
+    }
+    if (restart && running) startSegment();
+    return Promise.resolve();
   }
 
   /* ------------------------------------------------------- episodes */
@@ -536,6 +538,7 @@
     let sum = 0;
     for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
     const db = 20 * Math.log10(Math.sqrt(sum / data.length) + 1e-9);
+    try { encodePcm(data); } catch (e) { log('MP3 encode error: ' + e.message); }
     let s;
     try { s = scoreFrame(classifier.classify(new Float32Array(data), ctx.sampleRate)); }
     catch (e) { log('Classify error: ' + e.message); return; }
@@ -564,6 +567,7 @@
     ctx = new AudioContext({ sampleRate: 16000 });
     try {
       if (!MP) throw new Error('Detector library did not load');
+      if (!window.lamejs) throw new Error('MP3 library did not load. Check the connection and reload.');
       setStatus('Starting…', 'Loading the sound detector (first time takes a few seconds)', '');
       await loadClassifier();
       stream = await navigator.mediaDevices.getUserMedia({
@@ -620,12 +624,12 @@
 
   async function teardown() {
     clearInterval(rotateTimer); clearInterval(beatTimer);
-    try { if (recorder && recorder.state !== 'inactive') recorder.stop(); } catch (e) {}
     try { if (proc) proc.disconnect(); if (source) source.disconnect(); } catch (e) {}
     try { if (ctx) await ctx.close(); } catch (e) {}
     if (stream) stream.getTracks().forEach(t => t.stop());
     try { if (wakeLock) await wakeLock.release(); } catch (e) {}
-    proc = source = ctx = stream = recorder = wakeLock = null;
+    mp3 = null;
+    proc = source = ctx = stream = wakeLock = null;
   }
 
   async function keepAwake() {
