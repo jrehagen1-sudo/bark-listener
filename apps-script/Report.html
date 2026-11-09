@@ -1,0 +1,474 @@
+<script>
+/**
+ * Analytics + PDF report builder (no DOM access, so it can be tested on its own).
+ *   BarkReport.analyze(data, fromMs, toMs)  -> stats object
+ *   BarkReport.buildPdf(jsPDF, stats, settings) -> jsPDF document
+ */
+(function (root) {
+  'use strict';
+  const DAY = 86400000, HOUR = 3600000;
+
+  function startOfDay(t) { const d = new Date(t); d.setHours(0, 0, 0, 0); return d.getTime(); }
+  function addDays(t, n) { const d = new Date(t); d.setDate(d.getDate() + n); return d.getTime(); }
+  function inQuiet(hour, s) {
+    const a = Number(s.quietStart), b = Number(s.quietEnd);
+    return a > b ? (hour >= a || hour < b) : (hour >= a && hour < b);
+  }
+  function fmtDate(t) { return new Date(t).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' }); }
+  function fmtShortDate(t) { return new Date(t).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }); }
+  function fmtTime(t) { return new Date(t).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }); }
+  function fmtDur(min) {
+    if (min < 1) return Math.round(min * 60) + ' sec';
+    const h = Math.floor(min / 60), m = Math.round(min % 60);
+    return h ? h + ' hr ' + m + ' min' : m + ' min';
+  }
+  function hourLabel(h) { const ap = h < 12 ? 'AM' : 'PM'; const x = h % 12 || 12; return x + ' ' + ap; }
+
+  /** Minutes of [a,b) that fall in each local clock hour, added into arr[24]. */
+  function spreadByHour(a, b, arr) {
+    let t = a;
+    while (t < b) {
+      const d = new Date(t);
+      const next = new Date(d); next.setMinutes(0, 0, 0); next.setHours(next.getHours() + 1);
+      const end = Math.min(b, next.getTime());
+      arr[d.getHours()] += (end - t) / 60000;
+      t = end;
+    }
+  }
+  /** Overlap in ms between [a,b) and [c,d). */
+  function overlap(a, b, c, d) { return Math.max(0, Math.min(b, d) - Math.max(a, c)); }
+
+  function analyze(data, fromMs, toMs) {
+    const s = data.settings;
+    const eps = data.episodes
+      .map(e => Object.assign({}, e, { s: Date.parse(e.start), e: Date.parse(e.end) }))
+      .filter(e => e.s >= fromMs && e.s < toMs)
+      .sort((x, y) => x.s - y.s);
+
+    // Monitoring coverage from listener sessions (start -> stop or last check-in).
+    const sessions = data.sessions.map(x => ({
+      s: Date.parse(x.start),
+      e: Date.parse(x.stopped || x.lastBeat || x.start)
+    })).filter(x => isFinite(x.s) && isFinite(x.e) && x.e > x.s);
+
+    const days = [];
+    for (let d = startOfDay(fromMs); d < toMs; d = addDays(d, 1)) {
+      const dEnd = addDays(d, 1);
+      const de = eps.filter(e => e.s >= d && e.s < dEnd);
+      const sus = de.filter(e => e.sustained);
+      const monitoredMs = sessions.reduce((a, x) => a + overlap(x.s, x.e, Math.max(d, fromMs), Math.min(dEnd, toMs)), 0);
+      days.push({
+        day: d,
+        monitoredHours: monitoredMs / HOUR,
+        episodes: de.length,
+        sustained: sus.length,
+        sustainedMin: sus.reduce((a, e) => a + e.durationMin, 0),
+        allMin: de.reduce((a, e) => a + e.durationMin, 0),
+        longestMin: de.reduce((a, e) => Math.max(a, e.durationMin), 0),
+        quietSustained: sus.filter(e => quietOverlap(e, s) > 0).length
+      });
+    }
+
+    const sustained = eps.filter(e => e.sustained);
+    const byHourSus = new Array(24).fill(0), byHourAll = new Array(24).fill(0);
+    sustained.forEach(e => spreadByHour(e.s, e.e, byHourSus));
+    eps.forEach(e => spreadByHour(e.s, e.e, byHourAll));
+
+    const susMin = sustained.reduce((a, e) => a + e.durationMin, 0);
+    const longest = eps.reduce((a, e) => (!a || e.durationMin > a.durationMin ? e : a), null);
+    const daysMonitored = days.filter(d => d.monitoredHours >= 1 || d.episodes > 0).length;
+    const daysWithSus = days.filter(d => d.sustained > 0).length;
+    const quietSus = sustained.filter(e => quietOverlap(e, s) > 0);
+    const quietMin = sustained.reduce((a, e) => a + quietOverlap(e, s) / 60000, 0);
+    const monitoredHours = days.reduce((a, d) => a + d.monitoredHours, 0);
+    let peakHour = -1, peakVal = 0;
+    byHourSus.forEach((v, h) => { if (v > peakVal) { peakVal = v; peakHour = h; } });
+
+    const stats = {
+      from: fromMs, to: toMs, generated: Date.now(), settings: s,
+      episodes: eps, sustained: sustained, days: days,
+      byHourSus: byHourSus, byHourAll: byHourAll,
+      totals: {
+        episodes: eps.length, sustained: sustained.length,
+        sustainedMin: susMin, allMin: eps.reduce((a, e) => a + e.durationMin, 0),
+        avgSustainedMin: sustained.length ? susMin / sustained.length : 0,
+        longest: longest, daysMonitored: daysMonitored, daysWithSustained: daysWithSus,
+        quietSustained: quietSus.length, quietMin: quietMin,
+        monitoredHours: monitoredHours, peakHour: peakHour, peakHourMin: peakVal,
+        clips: sustained.reduce((a, e) => a + (e.clipCount || 0), 0)
+      }
+    };
+    stats.ordinance = ordinance(eps, s);
+    stats.findings = findings(stats);
+    return stats;
+  }
+
+  /** ms of an episode that fall within quiet hours. */
+  function quietOverlap(e, s) {
+    let ms = 0, t = e.s;
+    while (t < e.e) {
+      const d = new Date(t); const next = new Date(d); next.setMinutes(0, 0, 0); next.setHours(next.getHours() + 1);
+      const end = Math.min(e.e, next.getTime());
+      if (inQuiet(d.getHours(), s)) ms += end - t;
+      t = end;
+    }
+    return ms;
+  }
+
+  /**
+   * Ordinance test.
+   *  Incessant:    one continuous episode of incessantMinutes or more.
+   *  Intermittent: barking that adds up to intermittentMinutes or more within any rolling windowHours.
+   * Episodes from more than one device are merged first so overlapping time is never counted twice.
+   */
+  function ordinance(eps, s) {
+    const incLim = Number(s.incessantMinutes) || 30;
+    const intLim = Number(s.intermittentMinutes) || 60;
+    const winMs = (Number(s.windowHours) || 24) * HOUR;
+
+    const incessant = eps.filter(e => e.durationMin >= incLim);
+
+    const merged = [];
+    eps.slice().sort((a, b) => a.s - b.s).forEach(e => {
+      const last = merged[merged.length - 1];
+      if (last && e.s <= last.e) last.e = Math.max(last.e, e.e);
+      else merged.push({ s: e.s, e: e.e });
+    });
+
+    // The busiest window always starts at the start of some episode, so test each one.
+    let best = { total: 0, start: null, end: null };
+    const windows = [];
+    let nextFree = -Infinity;
+    for (let i = 0; i < merged.length; i++) {
+      const ws = merged[i].s, we = ws + winMs;
+      let total = 0, reachedAt = null, count = 0, lastEnd = ws;
+      for (let j = i; j < merged.length && merged[j].s < we; j++) {
+        const m = (Math.min(merged[j].e, we) - merged[j].s) / 60000;
+        if (m <= 0) continue;
+        if (reachedAt === null && total + m >= intLim) reachedAt = merged[j].s + (intLim - total) * 60000;
+        total += m; count++; lastEnd = Math.min(merged[j].e, we);
+      }
+      if (total > best.total) best = { total: total, start: ws, end: lastEnd };
+      // List separate (non-overlapping) 24-hour periods that went over the limit.
+      if (total >= intLim && ws >= nextFree) {
+        windows.push({ start: ws, end: we, lastBark: lastEnd, total: total, reachedAt: reachedAt, count: count });
+        nextFree = we;
+      }
+    }
+    const longest = eps.reduce((a, e) => (!a || e.durationMin > a.durationMin ? e : a), null);
+    return {
+      incLim: incLim, intLim: intLim, winHours: winMs / HOUR, name: s.ordinanceName || '',
+      incessant: incessant, incMet: incessant.length > 0, longest: longest,
+      intermittent: windows, intMet: windows.length > 0, best: best
+    };
+  }
+
+  function ordinanceLines(o) {
+    const out = [];
+    if (o.incMet) {
+      out.push('Incessant barking: limit exceeded. ' + o.incessant.length + ' continuous episode' + (o.incessant.length === 1 ? '' : 's') +
+        ' lasted ' + o.incLim + ' minutes or longer (longest ' + fmtDur(o.longest.durationMin) + ', ' + fmtDate(o.longest.s) + ', ' +
+        fmtTime(o.longest.s) + ' – ' + fmtTime(o.longest.e) + ').');
+    } else {
+      out.push('Incessant barking: not exceeded. No continuous episode reached ' + o.incLim + ' minutes' +
+        (o.longest ? ' (longest ' + fmtDur(o.longest.durationMin) + ').' : '.'));
+    }
+    if (o.intMet) {
+      out.push('Intermittent barking: limit exceeded in ' + o.intermittent.length + ' separate ' + o.winHours + '-hour period' +
+        (o.intermittent.length === 1 ? '' : 's') + '. The highest total was ' + fmtDur(o.best.total) + ' of barking within ' +
+        o.winHours + ' hours, starting ' + fmtDate(o.best.start) + ' at ' + fmtTime(o.best.start) + '.');
+    } else {
+      out.push('Intermittent barking: not exceeded. The highest total in any ' + o.winHours + '-hour period was ' +
+        fmtDur(o.best.total) + ' (limit ' + o.intLim + ' minutes).');
+    }
+    return out;
+  }
+
+  function findings(st) {
+    const T = st.totals, s = st.settings, out = [];
+    const sm = Number(s.sustainedMinutes);
+    if (!T.episodes) { out.push('No barking was detected during the selected period.'); return out; }
+    ordinanceLines(st.ordinance).forEach(l => out.push(l));
+    out.push(T.sustained + ' sustained barking episode' + (T.sustained === 1 ? '' : 's') + ' (' + sm +
+      ' minutes or longer) ' + (T.sustained === 1 ? 'was' : 'were') + ' recorded, totaling ' + fmtDur(T.sustainedMin) + ' of barking.');
+    if (T.daysMonitored) out.push('Sustained barking occurred on ' + T.daysWithSustained + ' of ' + T.daysMonitored +
+      ' monitored day' + (T.daysMonitored === 1 ? '' : 's') + ' (' + Math.round(T.daysWithSustained / T.daysMonitored * 100) + '%).');
+    if (T.longest) out.push('The longest episode lasted ' + fmtDur(T.longest.durationMin) + ', on ' + fmtDate(T.longest.s) +
+      ' from ' + fmtTime(T.longest.s) + ' to ' + fmtTime(T.longest.e) + '.');
+    if (T.sustained) out.push('Average sustained episode length: ' + fmtDur(T.avgSustainedMin) + '.');
+    if (T.quietSustained) out.push(T.quietSustained + ' sustained episode' + (T.quietSustained === 1 ? '' : 's') +
+      ' fell during quiet hours (' + hourLabel(Number(s.quietStart)) + ' – ' + hourLabel(Number(s.quietEnd)) + '), totaling ' +
+      fmtDur(T.quietMin) + ' of night-time barking.');
+    if (T.peakHour >= 0) out.push('Barking was most concentrated between ' + hourLabel(T.peakHour) + ' and ' +
+      hourLabel((T.peakHour + 1) % 24) + ' (' + fmtDur(T.peakHourMin) + ' across the period).');
+    out.push(T.episodes + ' bark cluster' + (T.episodes === 1 ? '' : 's') + ' of any length were detected in total (' +
+      fmtDur(T.allMin) + ').');
+    if (T.monitoredHours) out.push('The listening device logged ' + Math.round(T.monitoredHours) + ' hours of monitoring in this period.');
+    return out;
+  }
+
+  /* ----------------------------------------------------------------- PDF */
+
+  function buildPdf(jsPDF, st, s) {
+    const doc = new jsPDF({ unit: 'pt', format: 'letter' });
+    const W = doc.internal.pageSize.getWidth(), H = doc.internal.pageSize.getHeight(), M = 54;
+    const ink = [31, 42, 55], mute = [100, 110, 122], accent = [180, 35, 24], rule = [215, 220, 226];
+    const T = st.totals;
+    const period = fmtDate(st.from) + ' – ' + fmtDate(st.to - 1);
+
+    // ---- Cover / summary page
+    doc.setFillColor(...ink); doc.rect(0, 0, W, 110, 'F');
+    doc.setTextColor(255, 255, 255); doc.setFont('helvetica', 'bold'); doc.setFontSize(22);
+    doc.text('Barking Dog Noise Monitoring Report', M, 58);
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(11);
+    doc.text('Reporting period: ' + period, M, 82);
+
+    let y = 140;
+    const meta = [
+      ['Prepared by', s.preparedBy || '—'],
+      ['Monitoring location', s.monitoringLocation || '—'],
+      ['Source of barking', s.subjectProperty || '—'],
+      ['Reference', s.caseReference || '—'],
+      ['Report generated', new Date(st.generated).toLocaleString('en-US')]
+    ];
+    doc.setFontSize(10);
+    meta.forEach(([k, v]) => {
+      doc.setTextColor(...mute); doc.setFont('helvetica', 'normal'); doc.text(k, M, y);
+      doc.setTextColor(...ink); doc.setFont('helvetica', 'bold');
+      doc.text(doc.splitTextToSize(String(v), W - M - 190), 190, y);
+      y += 18;
+    });
+
+    // KPI tiles
+    y += 14;
+    const tiles = [
+      [String(T.sustained), 'Sustained episodes'],
+      [fmtDur(T.sustainedMin), 'Sustained barking'],
+      [T.daysMonitored ? T.daysWithSustained + ' / ' + T.daysMonitored : '0', 'Days affected'],
+      [String(T.quietSustained), 'During quiet hours']
+    ];
+    const tw = (W - 2 * M - 3 * 10) / 4;
+    tiles.forEach(([v, l], i) => {
+      const x = M + i * (tw + 10);
+      doc.setDrawColor(...rule); doc.setFillColor(247, 248, 250); doc.roundedRect(x, y, tw, 62, 4, 4, 'FD');
+      doc.setTextColor(...accent); doc.setFont('helvetica', 'bold'); doc.setFontSize(v.length > 9 ? 13 : 18);
+      doc.text(v, x + tw / 2, y + 30, { align: 'center' });
+      doc.setTextColor(...mute); doc.setFont('helvetica', 'normal'); doc.setFontSize(8.5);
+      doc.text(l, x + tw / 2, y + 48, { align: 'center' });
+    });
+    y += 92;
+
+    y = heading(doc, 'Key findings', M, y, ink);
+    doc.setFontSize(10.5); doc.setFont('helvetica', 'normal'); doc.setTextColor(...ink);
+    st.findings.forEach(f => {
+      const lines = doc.splitTextToSize(f, W - 2 * M - 16);
+      if (y + lines.length * 14 > H - 70) { doc.addPage(); y = M; }
+      doc.setFillColor(...accent); doc.circle(M + 3, y - 3.5, 2, 'F');
+      doc.text(lines, M + 14, y);
+      y += lines.length * 14 + 6;
+    });
+
+    // ---- Ordinance check page
+    doc.addPage(); y = M;
+    const o = st.ordinance;
+    y = heading(doc, 'Ordinance check', M, y, ink);
+    doc.setFontSize(9.5); doc.setFont('helvetica', 'normal'); doc.setTextColor(...mute);
+    const ruleText = (o.name ? o.name + ': ' : '') + 'incessant barking is continuous barking lasting ' + o.incLim +
+      ' minutes or more within any ' + o.winHours + '-hour period; intermittent barking is repeated barking that adds up to ' +
+      o.intLim + ' minutes or more within any ' + o.winHours + '-hour period.';
+    const rl = doc.splitTextToSize(ruleText, W - 2 * M); doc.text(rl, M, y); y += rl.length * 12.5 + 8;
+    doc.autoTable({
+      startY: y, margin: { left: M, right: M },
+      head: [['Rule', 'Limit', 'Recorded', 'Result']],
+      body: [
+        ['Incessant (continuous)', o.incLim + ' min in one episode', o.longest ? 'Longest: ' + fmtDur(o.longest.durationMin) : '—', o.incMet ? 'EXCEEDED (' + o.incessant.length + ')' : 'Not exceeded'],
+        ['Intermittent (total)', o.intLim + ' min within ' + o.winHours + ' h', 'Highest: ' + fmtDur(o.best.total), o.intMet ? 'EXCEEDED (' + o.intermittent.length + ')' : 'Not exceeded']
+      ],
+      styles: { font: 'helvetica', fontSize: 9.5, cellPadding: 6, textColor: ink },
+      headStyles: { fillColor: ink, textColor: 255, fontStyle: 'bold' },
+      didParseCell: (c) => { if (c.section === 'body' && c.column.index === 3 && /EXCEEDED/.test(c.cell.raw)) { c.cell.styles.textColor = accent; c.cell.styles.fontStyle = 'bold'; } }
+    });
+    y = doc.lastAutoTable.finalY + 22;
+    if (o.incessant.length) {
+      y = heading(doc, 'Incessant barking episodes (' + o.incLim + '+ minutes continuous)', M, y, ink);
+      doc.autoTable({
+        startY: y, margin: { left: M, right: M },
+        head: [['#', 'Date', 'Start', 'End', 'Duration', 'Audio']],
+        body: o.incessant.map((e, i) => [i + 1, fmtDate(e.s), fmtTime(e.s), fmtTime(e.e), fmtDur(e.durationMin), e.clipCount ? e.clipCount + ' clips' : '—']),
+        styles: { font: 'helvetica', fontSize: 8.5, cellPadding: 4, textColor: ink },
+        headStyles: { fillColor: ink, textColor: 255, fontStyle: 'bold' },
+        alternateRowStyles: { fillColor: [247, 248, 250] }
+      });
+      y = doc.lastAutoTable.finalY + 22;
+    }
+    if (o.intermittent.length) {
+      if (y > H - 160) { doc.addPage(); y = M; }
+      y = heading(doc, 'Intermittent barking: ' + o.winHours + '-hour periods over the limit', M, y, ink);
+      doc.autoTable({
+        startY: y, margin: { left: M, right: M },
+        head: [['#', 'Period starts', 'Limit reached', 'Last barking in period', 'Episodes', 'Total barking']],
+        body: o.intermittent.map((w, i) => [i + 1, fmtDate(w.start) + ' ' + fmtTime(w.start),
+          fmtDate(w.reachedAt) + ' ' + fmtTime(w.reachedAt), fmtDate(w.lastBark) + ' ' + fmtTime(w.lastBark), w.count, fmtDur(w.total)]),
+        styles: { font: 'helvetica', fontSize: 8.5, cellPadding: 4, textColor: ink },
+        headStyles: { fillColor: ink, textColor: 255, fontStyle: 'bold' },
+        alternateRowStyles: { fillColor: [247, 248, 250] }
+      });
+      y = doc.lastAutoTable.finalY + 10;
+      doc.setFontSize(8.5); doc.setTextColor(...mute);
+      const n = doc.splitTextToSize('Each row is a separate ' + o.winHours + '-hour period, counted from the first barking episode in it. "Limit reached" is the moment total barking in that period passed ' + o.intLim + ' minutes. Every episode is listed in the incident log.', W - 2 * M);
+      doc.text(n, M, y);
+    }
+
+    // ---- Charts page
+    doc.addPage(); y = M;
+    y = heading(doc, 'Barking by day', M, y, ink);
+    y = barChart(doc, {
+      x: M, y: y + 4, w: W - 2 * M, h: 190,
+      values: st.days.map(d => d.sustainedMin), values2: st.days.map(d => d.allMin - d.sustainedMin),
+      labels: st.days.map(d => fmtShortDate(d.day)), unit: 'min', colors: [accent, [232, 168, 160]],
+      legend: ['Sustained episodes (min)', 'Shorter clusters (min)']
+    }) + 26;
+    y = heading(doc, 'Barking by time of day (sustained episodes)', M, y, ink);
+    y = barChart(doc, {
+      x: M, y: y + 4, w: W - 2 * M, h: 190,
+      values: st.byHourSus, labels: st.byHourSus.map((_, h) => (h % 3 === 0 ? hourLabel(h) : '')),
+      unit: 'min', colors: [ink], shade: st.byHourSus.map((_, h) => inQuiet(h, s)),
+      legend: ['Minutes of barking', 'Shaded = quiet hours (' + hourLabel(Number(s.quietStart)) + ' – ' + hourLabel(Number(s.quietEnd)) + ')']
+    }) + 10;
+
+    // ---- Daily summary table
+    doc.addPage(); y = M;
+    y = heading(doc, 'Daily summary', M, y, ink);
+    doc.autoTable({
+      startY: y, margin: { left: M, right: M },
+      head: [['Date', 'Monitored', 'Clusters', 'Sustained', 'Sustained time', 'Longest', 'Quiet-hours sustained']],
+      body: st.days.map(d => [
+        fmtDate(d.day), d.monitoredHours ? d.monitoredHours.toFixed(1) + ' h' : '—', d.episodes, d.sustained,
+        d.sustainedMin ? fmtDur(d.sustainedMin) : '—', d.longestMin ? fmtDur(d.longestMin) : '—', d.quietSustained
+      ]),
+      styles: { font: 'helvetica', fontSize: 8.5, cellPadding: 4, textColor: ink },
+      headStyles: { fillColor: ink, textColor: 255, fontStyle: 'bold' },
+      alternateRowStyles: { fillColor: [247, 248, 250] }
+    });
+
+    // ---- Incident log
+    doc.addPage(); y = M;
+    y = heading(doc, 'Incident log — all barking episodes', M, y, ink);
+    if (!st.episodes.length) {
+      doc.setFontSize(10); doc.setTextColor(...mute); doc.text('No barking episodes in this period.', M, y);
+    } else {
+      doc.autoTable({
+        startY: y, margin: { left: M, right: M },
+        head: [['#', 'Date', 'Start', 'End', 'Duration', 'Bark density', 'Peak level', 'Audio']],
+        body: st.episodes.map((e, i) => [
+          i + 1, fmtDate(e.s), fmtTime(e.s), fmtTime(e.e), fmtDur(e.durationMin),
+          Math.round(e.density) + '%', e.peakDb ? e.peakDb.toFixed(0) + ' dBFS' : '—',
+          e.clipCount ? e.clipCount + ' clip' + (e.clipCount === 1 ? '' : 's') : (e.clipsUrl ? 'Yes' : '—')
+        ]),
+        styles: { font: 'helvetica', fontSize: 8.5, cellPadding: 4, textColor: ink },
+        headStyles: { fillColor: ink, textColor: 255, fontStyle: 'bold' },
+        alternateRowStyles: { fillColor: [247, 248, 250] },
+        didDrawCell: (c) => {
+          if (c.section === 'body' && c.column.index === 7) {
+            const ep = st.episodes[c.row.index];
+            if (ep && ep.clipsUrl) doc.link(c.cell.x, c.cell.y, c.cell.width, c.cell.height, { url: ep.clipsUrl });
+          }
+        }
+      });
+      y = doc.lastAutoTable.finalY + 10;
+      doc.setFontSize(8.5); doc.setTextColor(...mute);
+      doc.text('Bark density = share of the episode in which barking was detected. Audio entries link to the recordings.', M, y);
+    }
+
+    // ---- Methodology + declaration
+    doc.addPage(); y = M;
+    y = heading(doc, 'Method of monitoring', M, y, ink);
+    const method = [
+      'Sound was monitored continuously by a phone placed at the monitoring location listed on page 1. Software on the phone analyzed the audio about once per second with YAMNet, a published sound-classification model from Google that identifies dog barking among 521 sound types.',
+      'Each second classified as barking with a confidence of at least ' + Number(s.threshold).toFixed(2) + ' was counted. Detections separated by less than ' + s.gapSeconds + ' seconds of quiet were grouped into one episode. Episodes lasting ' + s.sustainedMinutes + ' minutes or longer are reported as sustained.',
+      'For each sustained episode the first and last ' + s.clipMinutes + ' minutes of audio were saved (plus up to one minute before barking began). Audio from shorter clusters was not kept. Each record was time-stamped by the phone\'s clock and written to a Google Sheet as it happened.',
+      'Sound levels are relative digital levels (dBFS) from an uncalibrated phone microphone. They show how loud each episode was compared with others, not an absolute decibel (dB SPL) measurement.',
+      'For the ordinance check, barking time is the length of each episode from first to last detected bark; pauses shorter than ' + s.gapSeconds + ' seconds count as part of the episode. Intermittent totals add up all episodes within each ' + (Number(s.windowHours) || 24) + '-hour period, with overlapping time counted once.',
+      'Monitoring hours are based on the device checking in every five minutes; gaps mean the device was off or offline, not that there was no barking.'
+    ];
+    doc.setFontSize(10); doc.setFont('helvetica', 'normal'); doc.setTextColor(...ink);
+    method.forEach(p => { const l = doc.splitTextToSize(p, W - 2 * M); doc.text(l, M, y); y += l.length * 13.5 + 8; });
+
+    y += 10;
+    y = heading(doc, 'Statement of the person who operated the monitor', M, y, ink);
+    const decl = 'I operated the monitoring device described above at the location stated. The records in this report were produced automatically by that device during the period shown, and I have not altered them.';
+    doc.setFontSize(10); doc.setTextColor(...ink);
+    const dl = doc.splitTextToSize(decl, W - 2 * M); doc.text(dl, M, y); y += dl.length * 13.5 + 40;
+    doc.setDrawColor(...ink);
+    doc.line(M, y, M + 230, y); doc.line(W - M - 160, y, W - M, y);
+    doc.setFontSize(8.5); doc.setTextColor(...mute);
+    doc.text('Signature', M, y + 12); doc.text('Date', W - M - 160, y + 12);
+    y += 40; doc.line(M, y, M + 230, y); doc.text('Printed name', M, y + 12);
+
+    // ---- Footer on every page
+    const n = doc.getNumberOfPages();
+    for (let i = 1; i <= n; i++) {
+      doc.setPage(i);
+      doc.setDrawColor(...rule); doc.line(M, H - 40, W - M, H - 40);
+      doc.setFontSize(8); doc.setTextColor(...mute); doc.setFont('helvetica', 'normal');
+      doc.text('Barking Dog Noise Monitoring Report · ' + period, M, H - 26);
+      doc.text('Page ' + i + ' of ' + n, W - M, H - 26, { align: 'right' });
+    }
+    return doc;
+  }
+
+  function heading(doc, text, x, y, ink) {
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(13); doc.setTextColor(...ink);
+    doc.text(text, x, y + 4);
+    doc.setFont('helvetica', 'normal');
+    return y + 24;
+  }
+
+  function niceMax(v) {
+    if (v <= 0) return 8;
+    const raw = v / 4, p = Math.pow(10, Math.floor(Math.log10(raw)));
+    for (const m of [1, 2, 5, 10]) if (m * p >= raw) return Math.max(4, 4 * m * p);
+    return 40 * p;
+  }
+
+  function barChart(doc, o) {
+    const left = o.x + 34, bottom = o.y + o.h - 30, top = o.y + 8, width = o.w - 34, height = bottom - top;
+    const tot = o.values.map((v, i) => v + (o.values2 ? o.values2[i] : 0));
+    const max = niceMax(Math.max(0, ...tot));
+    doc.setFontSize(7.5); doc.setFont('helvetica', 'normal');
+    for (let i = 0; i <= 4; i++) {
+      const yy = bottom - height * i / 4;
+      doc.setDrawColor(230, 233, 237); doc.line(left, yy, left + width, yy);
+      doc.setTextColor(120, 128, 138); doc.text(String(Math.round(max * i / 4)), left - 6, yy + 2.5, { align: 'right' });
+    }
+    const n = o.values.length || 1, slot = width / n, bw = Math.max(1.5, slot * 0.68);
+    o.values.forEach((v, i) => {
+      const x = left + i * slot + (slot - bw) / 2;
+      if (o.shade && o.shade[i]) { doc.setFillColor(238, 240, 244); doc.rect(left + i * slot, top, slot, height, 'F'); }
+      const h1 = height * v / max;
+      if (h1 > 0) { doc.setFillColor(...o.colors[0]); doc.rect(x, bottom - h1, bw, h1, 'F'); }
+      if (o.values2 && o.values2[i] > 0) {
+        const h2 = height * o.values2[i] / max;
+        doc.setFillColor(...o.colors[1]); doc.rect(x, bottom - h1 - h2, bw, h2, 'F');
+      }
+    });
+    // x labels (thin out if crowded)
+    const every = Math.max(1, Math.ceil(n / 16));
+    doc.setTextColor(120, 128, 138);
+    o.labels.forEach((l, i) => { if (l && i % every === 0) doc.text(l, left + i * slot + slot / 2, bottom + 11, { align: 'center' }); });
+    doc.setDrawColor(150, 156, 164); doc.line(left, bottom, left + width, bottom);
+    doc.text(o.unit, o.x, top - 2);
+    // legend
+    let lx = left; const ly = o.y + o.h - 2;
+    (o.legend || []).forEach((l, i) => {
+      const c = o.colors[i] || [238, 240, 244];
+      doc.setFillColor(...c); doc.setDrawColor(200, 205, 212); doc.rect(lx, ly - 6, 8, 8, 'FD');
+      doc.setTextColor(90, 98, 108); doc.text(l, lx + 12, ly + 1);
+      lx += doc.getTextWidth(l) + 30;
+    });
+    return o.y + o.h;
+  }
+
+  root.BarkReport = { analyze: analyze, buildPdf: buildPdf, fmtDur: fmtDur, fmtTime: fmtTime, fmtDate: fmtDate, hourLabel: hourLabel, inQuiet: inQuiet, startOfDay: startOfDay, addDays: addDays };
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>

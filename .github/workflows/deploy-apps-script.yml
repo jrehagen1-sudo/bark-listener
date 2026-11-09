@@ -1,0 +1,65 @@
+# Pushes apps-script/ to the Bark Monitor Apps Script project and updates the
+# existing web app deployment (same URL) whenever those files change on main.
+#
+# Needs three repository secrets (Settings → Secrets and variables → Actions):
+#   CLASPRC_JSON   contents of ~/.clasprc.json from `clasp login`
+#   SCRIPT_ID      Apps Script editor → Project Settings → Script ID
+#   DEPLOYMENT_ID  Deploy → Manage deployments → Deployment ID
+name: Deploy Apps Script
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'apps-script/**'
+      - '.github/workflows/deploy-apps-script.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-apps-script
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      CLASP: npx -y @google/clasp@3.4.1
+      CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
+      SCRIPT_ID: ${{ secrets.SCRIPT_ID }}
+      DEPLOYMENT_ID: ${{ secrets.DEPLOYMENT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Check secrets
+        run: |
+          missing=""
+          [ -z "$CLASPRC_JSON" ] && missing="$missing CLASPRC_JSON"
+          [ -z "$SCRIPT_ID" ] && missing="$missing SCRIPT_ID"
+          [ -z "$DEPLOYMENT_ID" ] && missing="$missing DEPLOYMENT_ID"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secrets:$missing"
+            exit 1
+          fi
+
+      - name: Write clasp credentials and project config
+        run: |
+          printf '%s' "$CLASPRC_JSON" > "$HOME/.clasprc.json"
+          chmod 600 "$HOME/.clasprc.json"
+          printf '{"scriptId":"%s","rootDir":"apps-script"}' "$SCRIPT_ID" > .clasp.json
+
+      - name: Push files to Apps Script
+        run: $CLASP push --force
+
+      - name: Update the existing web app deployment
+        run: $CLASP update-deployment "$DEPLOYMENT_ID" --description "GitHub ${GITHUB_SHA::7}"
+
+      - name: Remove credentials
+        if: always()
+        run: rm -f "$HOME/.clasprc.json" .clasp.json

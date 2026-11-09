@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html>
+<head>
+<base target="_top">
+<meta charset="utf-8">
+<style>
+  :root{--bg:#f5f6f8;--panel:#fff;--line:#e2e5ea;--ink:#1f2a37;--muted:#6b7480;--accent:#b42318;--accent2:#e8a8a0;--ok:#1a7f37;--shade:#eef0f4}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  header{background:var(--ink);color:#fff;padding:18px 16px}
+  header .in{max-width:1080px;margin:auto;display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between}
+  header h1{margin:0;font-size:19px}
+  header a{color:#cfd8e3;font-size:14px;margin-left:14px;text-decoration:none}
+  header a:hover{color:#fff}
+  main{max-width:1080px;margin:auto;padding:16px}
+  .bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:14px}
+  select,input,button{font:inherit;border:1px solid var(--line);border-radius:8px;padding:8px 10px;background:#fff;color:var(--ink)}
+  button{cursor:pointer;font-weight:600}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  .status{font-size:13px;color:var(--muted);margin-left:auto;display:flex;align-items:center;gap:6px}
+  .dot{width:9px;height:9px;border-radius:50%;background:#aaa}
+  .dot.on{background:var(--ok)}
+  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:14px}
+  .kpi{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px}
+  .kpi b{display:block;font-size:24px;color:var(--accent);line-height:1.2}
+  .kpi span{font-size:13px;color:var(--muted)}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  @media (max-width:760px){.grid{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:12px;min-width:0}
+  .card h2{font-size:15px;margin:0 0 10px}
+  .findings{margin:0;padding-left:18px}
+  .findings li{margin:4px 0}
+  svg text{font:10px system-ui,sans-serif;fill:var(--muted)}
+  .legend{font-size:12px;color:var(--muted);display:flex;gap:14px;margin-top:6px;flex-wrap:wrap}
+  .legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:-1px}
+  .tablewrap{overflow-x:auto}
+  table{border-collapse:collapse;width:100%;font-size:14px}
+  th,td{text-align:left;padding:8px;border-bottom:1px solid var(--line);white-space:nowrap}
+  th{font-size:12px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.03em}
+  .pill{font-size:11px;padding:2px 8px;border-radius:99px;background:#eceff3}
+  .pill.sus{background:#fde8e6;color:var(--accent);font-weight:600}
+  a{color:#0b62c4}
+  .form{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}
+  .form label{font-size:13px;color:var(--muted);display:block}
+  .form input{width:100%;margin-top:4px}
+  .muted{color:var(--muted);font-size:13px}
+  .empty{padding:30px;text-align:center;color:var(--muted)}
+  .rule{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;padding:10px 0;border-top:1px solid var(--line)}
+  .rule:first-of-type{border-top:0;padding-top:0}
+  .rule b{display:block}
+  .badge{font-size:12px;font-weight:700;padding:4px 10px;border-radius:99px;white-space:nowrap;background:#e7f4ea;color:var(--ok)}
+  .badge.over{background:#fde8e6;color:var(--accent)}
+  .wins{margin:6px 0 0;padding-left:18px;font-size:14px}
+  .form h3{grid-column:1/-1;margin:8px 0 0;font-size:14px}
+  #msg{font-size:13px;color:var(--ok);margin-left:8px}
+</style>
+</head>
+<body>
+<header><div class="in">
+  <h1>Bark Monitor</h1>
+  <nav>
+    <a href="#" id="listenerLink" target="_blank">Listener</a>
+    <a href="<?= sheetUrl ?>" target="_blank">Log sheet</a>
+    <a href="<?= folderUrl ?>" target="_blank">Audio clips</a>
+  </nav>
+</div></header>
+
+<main>
+  <div class="bar">
+    <select id="range">
+      <option value="7">Last 7 days</option>
+      <option value="14" selected>Last 14 days</option>
+      <option value="30">Last 30 days</option>
+      <option value="90">Last 90 days</option>
+      <option value="all">All data</option>
+      <option value="custom">Custom…</option>
+    </select>
+    <span id="customBox" style="display:none">
+      <input type="date" id="from"> to <input type="date" id="to">
+    </span>
+    <button id="refresh">Refresh</button>
+    <button id="pdfBtn" class="primary">Download PDF report</button>
+    <span class="status"><span class="dot" id="liveDot"></span><span id="liveTxt">Checking listener…</span></span>
+  </div>
+
+  <div class="kpis" id="kpis"></div>
+
+  <div class="card" id="ordCard">
+    <h2>Ordinance check</h2>
+    <div id="ord" class="muted">Loading…</div>
+  </div>
+
+  <div class="card">
+    <h2>Key findings</h2>
+    <ul class="findings" id="findings"><li class="muted">Loading…</li></ul>
+  </div>
+
+  <div class="grid">
+    <div class="card"><h2>Barking by day (minutes)</h2><div id="dayChart"></div>
+      <div class="legend"><span><i style="background:var(--accent)"></i>Sustained</span><span><i style="background:var(--accent2)"></i>Shorter clusters</span></div></div>
+    <div class="card"><h2>Time of day (sustained minutes)</h2><div id="hourChart"></div>
+      <div class="legend"><span><i style="background:var(--ink)"></i>Minutes of barking</span><span><i style="background:var(--shade);border:1px solid var(--line)"></i>Quiet hours</span></div></div>
+  </div>
+
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+      <h2 style="margin:0">Incidents</h2>
+      <label class="muted"><input type="checkbox" id="susOnly" checked> Sustained only</label>
+    </div>
+    <div class="tablewrap"><table>
+      <thead><tr><th>Date</th><th>Start</th><th>End</th><th>Duration</th><th>Density</th><th>Peak level</th><th>Type</th><th>Audio</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table></div>
+  </div>
+
+  <div class="card">
+    <h2>Report details</h2>
+    <p class="muted" style="margin-top:0">These appear on the first page of the PDF.</p>
+    <div class="form">
+      <label>Prepared by<input id="preparedBy" placeholder="Your full name"></label>
+      <label>Monitoring location<input id="monitoringLocation" placeholder="Your address / which window"></label>
+      <label>Source of barking<input id="subjectProperty" placeholder="Neighbor's address"></label>
+      <label>Reference<input id="caseReference" placeholder="Animal control or case number"></label>
+      <h3>Ordinance rules</h3>
+      <label>Ordinance name<input id="ordinanceName"></label>
+      <label>Incessant: continuous minutes<input id="incessantMinutes" type="number" min="1"></label>
+      <label>Intermittent: total minutes<input id="intermittentMinutes" type="number" min="1"></label>
+      <label>Within this many hours<input id="windowHours" type="number" min="1"></label>
+      <h3>Listener</h3>
+      <label>Keep audio for episodes at least (minutes)<input id="audioMinMinutes" type="number" min="0" step="0.5"></label>
+      <label>Listener page address (GitHub Pages)<input id="listenerUrl" placeholder="https://yourname.github.io/bark-listener/"></label>
+      <label>Quiet hours start (0–23)<input id="quietStart" type="number" min="0" max="23"></label>
+      <label>Quiet hours end (0–23)<input id="quietEnd" type="number" min="0" max="23"></label>
+    </div>
+    <div style="margin-top:12px"><button id="saveDetails">Save details</button><span id="msg"></span></div>
+  </div>
+</main>
+
+<?!= include('Report') ?>
+<script src="https://cdn.jsdelivr.net/npm/jspdf@4.2.1/dist/jspdf.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jspdf-autotable@5.0.9/dist/jspdf.plugin.autotable.min.js"></script>
+<script>
+(function () {
+  'use strict';
+  const R = window.BarkReport;
+  const $ = (id) => document.getElementById(id);
+  const run = (fn, ...args) => new Promise((resolve, reject) =>
+    google.script.run.withSuccessHandler(resolve).withFailureHandler(reject)[fn](...args));
+  const esc = (v) => String(v).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const DETAILS = ['preparedBy', 'monitoringLocation', 'subjectProperty', 'caseReference', 'quietStart', 'quietEnd', 'listenerUrl', 'ordinanceName', 'incessantMinutes', 'intermittentMinutes', 'windowHours', 'audioMinMinutes'];
+  const API_URL = <?!= JSON.stringify(appUrl) ?>;
+  const API_KEY = <?!= JSON.stringify(apiKey) ?>;
+
+  /** Listener link carries the API address and key after '#', which browsers never send to GitHub. */
+  function updateListenerLink() {
+    const base = (data && data.settings.listenerUrl || '').trim();
+    const a = $('listenerLink');
+    if (!base) { a.href = '#'; a.onclick = (e) => { e.preventDefault(); alert('Enter the Listener page address under Report details first.'); }; return; }
+    a.onclick = null;
+    a.href = base.replace(/#.*$/, '') + '#api=' + encodeURIComponent(API_URL) + '&key=' + encodeURIComponent(API_KEY);
+  }
+
+  let data = null, stats = null;
+
+  function currentRange() {
+    const v = $('range').value;
+    const tomorrow = R.addDays(R.startOfDay(Date.now()), 1);
+    if (v === 'custom') {
+      const f = $('from').value, t = $('to').value;
+      if (f && t) {
+        const [fy, fm, fd] = f.split('-').map(Number), [ty, tm, td] = t.split('-').map(Number);
+        return [new Date(fy, fm - 1, fd).getTime(), new Date(ty, tm - 1, td + 1).getTime()];
+      }
+      return [R.addDays(tomorrow, -14), tomorrow];
+    }
+    if (v === 'all') {
+      const times = data.episodes.map(e => Date.parse(e.start)).concat(data.sessions.map(s => Date.parse(s.start))).filter(isFinite);
+      return [times.length ? R.startOfDay(Math.min(...times)) : R.addDays(tomorrow, -7), tomorrow];
+    }
+    return [R.addDays(tomorrow, -Number(v)), tomorrow];
+  }
+
+  function render() {
+    const [from, to] = currentRange();
+    stats = R.analyze(data, from, to);
+    const T = stats.totals;
+
+    const kp = [
+      [T.sustained, 'Sustained episodes (' + data.settings.sustainedMinutes + '+ min)'],
+      [R.fmtDur(T.sustainedMin), 'Sustained barking time'],
+      [T.daysMonitored ? T.daysWithSustained + ' / ' + T.daysMonitored : '0', 'Days with sustained barking'],
+      [T.quietSustained, 'Sustained during quiet hours'],
+      [T.longest ? R.fmtDur(T.longest.durationMin) : '—', 'Longest episode'],
+      [T.episodes, 'Bark clusters (any length)']
+    ];
+    $('kpis').innerHTML = kp.map(k => '<div class="kpi"><b>' + esc(k[0]) + '</b><span>' + esc(k[1]) + '</span></div>').join('');
+    $('findings').innerHTML = stats.findings.map(f => '<li>' + esc(f) + '</li>').join('');
+    renderOrdinance(stats.ordinance);
+
+    $('dayChart').innerHTML = svgBars(
+      stats.days.map(d => d.sustainedMin), stats.days.map(d => Math.max(0, d.allMin - d.sustainedMin)),
+      stats.days.map(d => new Date(d.day).toLocaleDateString('en-US', { month: 'numeric', day: 'numeric' })), null);
+    $('hourChart').innerHTML = svgBars(
+      stats.byHourSus, null, stats.byHourSus.map((_, h) => h % 3 === 0 ? R.hourLabel(h).replace(' ', '') : ''),
+      stats.byHourSus.map((_, h) => R.inQuiet(h, data.settings)));
+
+    renderRows();
+  }
+
+  function renderOrdinance(o) {
+    const when = (t) => new Date(t).toLocaleString('en-US', { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+    let h = '<div class="rule"><div><b>Incessant: ' + o.incLim + '+ minutes continuous</b><span class="muted">' +
+      (o.longest ? 'Longest episode: ' + esc(R.fmtDur(o.longest.durationMin)) + ' (' + esc(when(o.longest.s)) + ')' : 'No episodes yet') + '</span>';
+    if (o.incessant.length) h += '<ul class="wins">' + o.incessant.slice(-10).reverse().map(e => '<li>' + esc(when(e.s)) + ' – ' + esc(R.fmtTime(e.e)) + ' · ' + esc(R.fmtDur(e.durationMin)) + '</li>').join('') + '</ul>';
+    h += '</div><span class="badge' + (o.incMet ? ' over">EXCEEDED · ' + o.incessant.length : '">Not exceeded') + '</span></div>';
+    h += '<div class="rule"><div><b>Intermittent: ' + o.intLim + '+ minutes within ' + o.winHours + ' hours</b><span class="muted">' +
+      'Highest total in any ' + o.winHours + ' hours: ' + esc(R.fmtDur(o.best.total)) + (o.best.start ? ' (from ' + esc(when(o.best.start)) + ')' : '') + '</span>';
+    if (o.intermittent.length) h += '<ul class="wins">' + o.intermittent.slice(-10).reverse().map(w => '<li>Period from ' + esc(when(w.start)) + ': limit reached ' + esc(when(w.reachedAt)) + ' · ' + esc(R.fmtDur(w.total)) + ' total</li>').join('') + '</ul>';
+    h += '</div><span class="badge' + (o.intMet ? ' over">EXCEEDED · ' + o.intermittent.length : '">Not exceeded') + '</span></div>';
+    $('ord').className = ''; $('ord').innerHTML = h;
+  }
+
+  function renderRows() {
+    const list = ($('susOnly').checked ? stats.sustained : stats.episodes).slice().reverse();
+    if (!list.length) { $('rows').innerHTML = '<tr><td colspan="8" class="empty">No incidents in this period.</td></tr>'; return; }
+    $('rows').innerHTML = list.map(e =>
+      '<tr><td>' + esc(new Date(e.s).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })) + '</td>' +
+      '<td>' + esc(R.fmtTime(e.s)) + '</td><td>' + esc(R.fmtTime(e.e)) + '</td>' +
+      '<td>' + esc(R.fmtDur(e.durationMin)) + '</td><td>' + Math.round(e.density) + '%</td>' +
+      '<td>' + (e.peakDb ? e.peakDb.toFixed(0) + ' dBFS' : '—') + '</td>' +
+      '<td><span class="pill' + (e.sustained ? ' sus' : '') + '">' + (e.sustained ? 'Sustained' : 'Short') + '</span></td>' +
+      '<td>' + (e.clipsUrl ? '<a href="' + esc(e.clipsUrl) + '" target="_blank">' + (e.clipCount || '') + ' clip' + (e.clipCount === 1 ? '' : 's') + '</a>' : '—') + '</td></tr>'
+    ).join('');
+  }
+
+  function svgBars(v1, v2, labels, shade) {
+    const W = 520, H = 210, L = 30, B = 22, Tp = 8, w = W - L - 4, h = H - B - Tp;
+    const tot = v1.map((v, i) => v + (v2 ? v2[i] : 0));
+    const max = niceMax(Math.max(0, ...tot));
+    const n = v1.length || 1, slot = w / n, bw = Math.max(1.5, slot * 0.68);
+    let s = '<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" role="img">';
+    for (let i = 0; i <= 4; i++) {
+      const y = Tp + h - h * i / 4;
+      s += '<line x1="' + L + '" x2="' + (L + w) + '" y1="' + y + '" y2="' + y + '" stroke="#e6e9ee"/>';
+      s += '<text x="' + (L - 5) + '" y="' + (y + 3) + '" text-anchor="end">' + Math.round(max * i / 4) + '</text>';
+    }
+    const every = Math.max(1, Math.ceil(n / 14));
+    v1.forEach((v, i) => {
+      const x = L + i * slot;
+      if (shade && shade[i]) s += '<rect x="' + x + '" y="' + Tp + '" width="' + slot + '" height="' + h + '" fill="#eef0f4"/>';
+      const h1 = h * v / max, h2 = v2 ? h * v2[i] / max : 0, bx = x + (slot - bw) / 2;
+      const title = '<title>' + esc(labels[i] || '') + ': ' + Math.round(tot[i]) + ' min</title>';
+      if (h1) s += '<rect x="' + bx + '" y="' + (Tp + h - h1) + '" width="' + bw + '" height="' + h1 + '" rx="1.5" fill="' + (v2 ? '#b42318' : '#1f2a37') + '">' + title + '</rect>';
+      if (h2) s += '<rect x="' + bx + '" y="' + (Tp + h - h1 - h2) + '" width="' + bw + '" height="' + h2 + '" rx="1.5" fill="#e8a8a0">' + title + '</rect>';
+      if (labels[i] && i % every === 0) s += '<text x="' + (x + slot / 2) + '" y="' + (H - 6) + '" text-anchor="middle">' + esc(labels[i]) + '</text>';
+    });
+    s += '<line x1="' + L + '" x2="' + (L + w) + '" y1="' + (Tp + h) + '" y2="' + (Tp + h) + '" stroke="#9aa1aa"/></svg>';
+    return s;
+  }
+  function niceMax(v) {
+    if (v <= 0) return 8;
+    const raw = v / 4, p = Math.pow(10, Math.floor(Math.log10(raw)));
+    for (const m of [1, 2, 5, 10]) if (m * p >= raw) return Math.max(4, 4 * m * p);
+    return 40 * p;
+  }
+
+  function showLive() {
+    const last = data.sessions.map(s => ({ s: s, t: Date.parse(s.lastBeat || s.start) }))
+      .filter(x => isFinite(x.t)).sort((a, b) => b.t - a.t)[0];
+    if (!last) { $('liveTxt').textContent = 'Listener has not run yet'; return; }
+    const mins = Math.round((Date.now() - last.t) / 60000);
+    const online = last.s.status === 'Running' && mins <= 12;
+    $('liveDot').className = 'dot' + (online ? ' on' : '');
+    $('liveTxt').textContent = online
+      ? 'Listener online · checked in ' + (mins <= 1 ? 'just now' : mins + ' min ago')
+      : 'Listener offline · last seen ' + new Date(last.t).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+  }
+
+  async function load() {
+    $('refresh').disabled = true;
+    try {
+      data = await run('getDashboardData', API_KEY);
+      DETAILS.forEach(k => { $(k).value = data.settings[k]; });
+      render(); showLive(); updateListenerLink();
+    } catch (e) {
+      $('findings').innerHTML = '<li>Could not load data: ' + esc(e.message || e) + '</li>';
+    } finally { $('refresh').disabled = false; }
+  }
+
+  $('range').onchange = () => { $('customBox').style.display = $('range').value === 'custom' ? '' : 'none'; if (data) render(); };
+  $('from').onchange = $('to').onchange = () => { if (data) render(); };
+  $('refresh').onclick = load;
+  $('susOnly').onchange = renderRows;
+
+  $('saveDetails').onclick = async () => {
+    const s = {}; DETAILS.forEach(k => { s[k] = $(k).value; });
+    try { data.settings = await run('saveSettings', API_KEY, s); render(); updateListenerLink(); $('msg').textContent = 'Saved'; setTimeout(() => $('msg').textContent = '', 2500); }
+    catch (e) { $('msg').textContent = 'Save failed: ' + (e.message || e); }
+  };
+
+  $('pdfBtn').onclick = () => {
+    if (!stats) return;
+    if (!window.jspdf) { alert('The PDF library did not load. Check your connection and refresh.'); return; }
+    const s = Object.assign({}, data.settings);
+    DETAILS.forEach(k => { s[k] = $(k).value; });
+    const doc = R.buildPdf(window.jspdf.jsPDF, stats, s);
+    const d = (t) => { const x = new Date(t); return x.getFullYear() + '-' + String(x.getMonth() + 1).padStart(2, '0') + '-' + String(x.getDate()).padStart(2, '0'); };
+    doc.save('Barking-Report_' + d(stats.from) + '_to_' + d(stats.to - 1) + '.pdf');
+  };
+
+  load();
+  setInterval(() => { if (document.visibilityState === 'visible') load(); }, 5 * 60000);
+})();
+</script>
+</body>
+</html>
