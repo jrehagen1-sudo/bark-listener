@@ -98,6 +98,7 @@
         clips: sustained.reduce((a, e) => a + (e.clipCount || 0), 0)
       }
     };
+    stats.barkSessions = barkSessions(eps, s);
     stats.ordinance = ordinance(eps, s);
     stats.findings = findings(stats);
     return stats;
@@ -163,6 +164,25 @@
     };
   }
 
+  /** Groups bursts into bark sessions: a burst starting within sessionGapMinutes of the previous one's end joins it. */
+  function barkSessions(eps, s) {
+    const gap = (Number(s.sessionGapMinutes) || 30) * 60000;
+    const out = [];
+    let cur = null;
+    eps.forEach(e => {
+      if (cur && e.s - cur.e <= gap) {
+        cur.e = Math.max(cur.e, e.e);
+      } else {
+        cur = { n: out.length + 1, s: e.s, e: e.e, bursts: 0, barkingMin: 0, clips: 0, eps: [] };
+        out.push(cur);
+      }
+      cur.bursts++; cur.barkingMin += e.durationMin; cur.clips += e.clipCount || 0; cur.eps.push(e);
+      e.bs = cur.n;
+    });
+    out.forEach(x => { x.spanMin = (x.e - x.s) / 60000; });
+    return out;
+  }
+
   function ordinanceLines(o) {
     const out = [];
     if (o.incMet) {
@@ -189,6 +209,13 @@
     const sm = Number(s.sustainedMinutes);
     if (!T.episodes) { out.push('No barking was detected during the selected period.'); return out; }
     ordinanceLines(st.ordinance).forEach(l => out.push(l));
+    const bs = st.barkSessions;
+    if (bs.length) {
+      const big = bs.reduce((a, x) => (x.barkingMin > a.barkingMin ? x : a), bs[0]);
+      out.push('Barking came in ' + bs.length + ' session' + (bs.length === 1 ? '' : 's') + ' (bursts less than ' +
+        (Number(s.sessionGapMinutes) || 30) + ' minutes apart grouped together). The largest ran from ' + fmtDate(big.s) + ' ' +
+        fmtTime(big.s) + ' to ' + fmtTime(big.e) + ': ' + big.bursts + ' burst' + (big.bursts === 1 ? '' : 's') + ', ' + fmtDur(big.barkingMin) + ' of barking.');
+    }
     out.push(T.sustained + ' sustained barking episode' + (T.sustained === 1 ? '' : 's') + ' (' + sm +
       ' minutes or longer) ' + (T.sustained === 1 ? 'was' : 'were') + ' recorded, totaling ' + fmtDur(T.sustainedMin) + ' of barking.');
     if (T.daysMonitored) out.push('Sustained barking occurred on ' + T.daysWithSustained + ' of ' + T.daysMonitored +
@@ -353,15 +380,32 @@
 
     // ---- Incident log
     doc.addPage(); y = M;
+    y = heading(doc, 'Barking sessions', M, y, ink);
+    doc.setFontSize(8.5); doc.setTextColor(...mute);
+    doc.text('Bursts less than ' + (Number(s.sessionGapMinutes) || 30) + ' minutes apart are grouped into one session.', M, y - 6);
+    if (!st.barkSessions.length) {
+      doc.setFontSize(10); doc.text('No barking in this period.', M, y + 8);
+    } else {
+      doc.autoTable({
+        startY: y, margin: { left: M, right: M },
+        head: [['Session', 'Date', 'Start', 'End', 'Bursts', 'Barking time', 'Audio clips']],
+        body: st.barkSessions.map(x => [x.n, fmtDate(x.s), fmtTime(x.s), fmtTime(x.e), x.bursts, fmtDur(x.barkingMin), x.clips || '—']),
+        styles: { font: 'helvetica', fontSize: 8.5, cellPadding: 4, textColor: ink },
+        headStyles: { fillColor: ink, textColor: 255, fontStyle: 'bold' },
+        alternateRowStyles: { fillColor: [247, 248, 250] }
+      });
+    }
+
+    doc.addPage(); y = M;
     y = heading(doc, 'Incident log — all barking episodes', M, y, ink);
     if (!st.episodes.length) {
       doc.setFontSize(10); doc.setTextColor(...mute); doc.text('No barking episodes in this period.', M, y);
     } else {
       doc.autoTable({
         startY: y, margin: { left: M, right: M },
-        head: [['#', 'Date', 'Start', 'End', 'Duration', 'Bark density', 'Peak level', 'Audio']],
+        head: [['#', 'Session', 'Date', 'Start', 'End', 'Duration', 'Bark density', 'Peak level', 'Audio']],
         body: st.episodes.map((e, i) => [
-          i + 1, fmtDate(e.s), fmtTime(e.s), fmtTime(e.e), fmtDur(e.durationMin),
+          i + 1, e.bs || '', fmtDate(e.s), fmtTime(e.s), fmtTime(e.e), fmtDur(e.durationMin),
           Math.round(e.density) + '%', e.peakDb ? e.peakDb.toFixed(0) + ' dBFS' : '—',
           e.clipCount ? e.clipCount + ' clip' + (e.clipCount === 1 ? '' : 's') : (e.clipsUrl ? 'Yes' : '—')
         ]),
@@ -369,7 +413,7 @@
         headStyles: { fillColor: ink, textColor: 255, fontStyle: 'bold' },
         alternateRowStyles: { fillColor: [247, 248, 250] },
         didDrawCell: (c) => {
-          if (c.section === 'body' && c.column.index === 7) {
+          if (c.section === 'body' && c.column.index === 8) {
             const ep = st.episodes[c.row.index];
             if (ep && ep.clipsUrl) doc.link(c.cell.x, c.cell.y, c.cell.width, c.cell.height, { url: ep.clipsUrl });
           }

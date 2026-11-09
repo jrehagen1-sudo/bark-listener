@@ -95,6 +95,15 @@
     <ul class="findings" id="findings"><li class="muted">Loading…</li></ul>
   </div>
 
+  <div class="card">
+    <h2>Barking sessions</h2>
+    <p class="muted" style="margin-top:-4px" id="bsNote"></p>
+    <div class="tablewrap"><table>
+      <thead><tr><th>Session</th><th>Date</th><th>Start</th><th>End</th><th>Bursts</th><th>Barking time</th><th>Audio clips</th></tr></thead>
+      <tbody id="bsRows"></tbody>
+    </table></div>
+  </div>
+
   <div class="grid">
     <div class="card"><h2>Barking by day (minutes)</h2><div id="dayChart"></div>
       <div class="legend"><span><i style="background:var(--accent)"></i>Sustained</span><span><i style="background:var(--accent2)"></i>Shorter clusters</span></div></div>
@@ -108,7 +117,7 @@
       <label class="muted"><input type="checkbox" id="susOnly" checked> Sustained only</label>
     </div>
     <div class="tablewrap"><table>
-      <thead><tr><th>Date</th><th>Start</th><th>End</th><th>Duration</th><th>Density</th><th>Peak level</th><th>Type</th><th>Audio</th></tr></thead>
+      <thead><tr><th>Session</th><th>Date</th><th>Start</th><th>End</th><th>Duration</th><th>Density</th><th>Peak level</th><th>Type</th><th>Audio</th></tr></thead>
       <tbody id="rows"></tbody>
     </table></div>
   </div>
@@ -128,6 +137,7 @@
       <label>Within this many hours<input id="windowHours" type="number" min="1"></label>
       <h3>Listener</h3>
       <label>Keep audio for episodes at least (minutes)<input id="audioMinMinutes" type="number" min="0" step="0.5"></label>
+      <label>Group bursts into one session when less than (minutes) apart<input id="sessionGapMinutes" type="number" min="1" step="5"></label>
       <label>Also keep shorter bursts if barking returns within (minutes, 0 = off)<input id="shortBurstWindowMinutes" type="number" min="0" step="5"></label>
       <label>Listener page address (GitHub Pages)<input id="listenerUrl" placeholder="https://yourname.github.io/bark-listener/"></label>
       <label>Quiet hours start (0–23)<input id="quietStart" type="number" min="0" max="23"></label>
@@ -148,7 +158,7 @@
   const run = (fn, ...args) => new Promise((resolve, reject) =>
     google.script.run.withSuccessHandler(resolve).withFailureHandler(reject)[fn](...args));
   const esc = (v) => String(v).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-  const DETAILS = ['preparedBy', 'monitoringLocation', 'subjectProperty', 'caseReference', 'quietStart', 'quietEnd', 'listenerUrl', 'ordinanceName', 'incessantMinutes', 'intermittentMinutes', 'windowHours', 'audioMinMinutes', 'shortBurstWindowMinutes'];
+  const DETAILS = ['preparedBy', 'monitoringLocation', 'subjectProperty', 'caseReference', 'quietStart', 'quietEnd', 'listenerUrl', 'ordinanceName', 'incessantMinutes', 'intermittentMinutes', 'windowHours', 'audioMinMinutes', 'shortBurstWindowMinutes', 'sessionGapMinutes'];
   const API_URL = <?!= JSON.stringify(appUrl) ?>;
   const API_KEY = <?!= JSON.stringify(apiKey) ?>;
 
@@ -197,6 +207,7 @@
     $('kpis').innerHTML = kp.map(k => '<div class="kpi"><b>' + esc(k[0]) + '</b><span>' + esc(k[1]) + '</span></div>').join('');
     $('findings').innerHTML = stats.findings.map(f => '<li>' + esc(f) + '</li>').join('');
     renderOrdinance(stats.ordinance);
+    renderSessions(stats.barkSessions);
 
     $('dayChart').innerHTML = svgBars(
       stats.days.map(d => d.sustainedMin), stats.days.map(d => Math.max(0, d.allMin - d.sustainedMin)),
@@ -221,11 +232,20 @@
     $('ord').className = ''; $('ord').innerHTML = h;
   }
 
+  function renderSessions(list) {
+    $('bsNote').textContent = 'Bursts less than ' + (Number(data.settings.sessionGapMinutes) || 30) + ' minutes apart are grouped into one session.';
+    if (!list.length) { $('bsRows').innerHTML = '<tr><td colspan="7" class="empty">No barking in this period.</td></tr>'; return; }
+    $('bsRows').innerHTML = list.slice().reverse().map(x =>
+      '<tr><td>' + x.n + '</td><td>' + esc(new Date(x.s).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })) + '</td>' +
+      '<td>' + esc(R.fmtTime(x.s)) + '</td><td>' + esc(R.fmtTime(x.e)) + '</td><td>' + x.bursts + '</td>' +
+      '<td>' + esc(R.fmtDur(x.barkingMin)) + '</td><td>' + (x.clips || '—') + '</td></tr>').join('');
+  }
+
   function renderRows() {
     const list = ($('susOnly').checked ? stats.sustained : stats.episodes).slice().reverse();
-    if (!list.length) { $('rows').innerHTML = '<tr><td colspan="8" class="empty">No incidents in this period.</td></tr>'; return; }
+    if (!list.length) { $('rows').innerHTML = '<tr><td colspan="9" class="empty">No incidents in this period.</td></tr>'; return; }
     $('rows').innerHTML = list.map(e =>
-      '<tr><td>' + esc(new Date(e.s).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })) + '</td>' +
+      '<tr><td>' + (e.bs || '') + '</td><td>' + esc(new Date(e.s).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })) + '</td>' +
       '<td>' + esc(R.fmtTime(e.s)) + '</td><td>' + esc(R.fmtTime(e.e)) + '</td>' +
       '<td>' + esc(R.fmtDur(e.durationMin)) + '</td><td>' + Math.round(e.density) + '%</td>' +
       '<td>' + (e.peakDb ? e.peakDb.toFixed(0) + ' dBFS' : '—') + '</td>' +

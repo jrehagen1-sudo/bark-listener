@@ -15,7 +15,7 @@ const SHEET_SESSIONS = 'Sessions';
 const EPISODE_HEADERS = [
   'Episode ID', 'Start', 'End', 'Duration (min)', 'Bark seconds',
   'Bark density (%)', 'Peak confidence', 'Avg confidence', 'Peak level (dBFS)',
-  'Sustained', 'Clips folder', 'Clip count', 'Device', 'Session ID', 'Notes'
+  'Sustained', 'Clips folder', 'Clip count', 'Device', 'Session ID', 'Notes', 'Bark session'
 ];
 const SESSION_HEADERS = [
   'Session ID', 'Device', 'Started', 'Last heartbeat', 'Stopped', 'Status'
@@ -29,6 +29,7 @@ const DEFAULT_SETTINGS = {
   clipMinutes: 5,           // keep first N and last N minutes of audio
   audioMinMinutes: 1,       // keep audio for episodes at least this long
   shortBurstWindowMinutes: 30, // also keep shorter bursts if barking returns within this time (0 = off)
+  sessionGapMinutes: 30,    // bursts closer together than this belong to the same bark session
   incessantMinutes: 30,     // ordinance: continuous barking limit
   intermittentMinutes: 60,  // ordinance: total barking limit within the window
   windowHours: 24,          // ordinance: rolling window
@@ -252,14 +253,41 @@ function logEpisode_(ep) {
     const durMin = Math.max(0, (end - start) / 60000);
     const barkSec = Number(ep.barkSeconds) || 0;
     const density = durMin > 0 ? Math.min(100, (barkSec / (durMin * 60)) * 100) : 100;
+    const tag = barkSessionTag_(sh, start);
     sh.appendRow([
       String(ep.id), start, end, round_(durMin, 2), barkSec,
       round_(density, 1), round_(ep.peakConf, 3), round_(ep.avgConf, 3),
       round_(ep.peakDb, 1), ep.sustained ? 'Yes' : 'No',
-      '', 0, String(ep.device || '').slice(0, 60), String(ep.sessionId || ''), ''
+      '', 0, String(ep.device || '').slice(0, 60), String(ep.sessionId || ''), '', tag
     ]);
-    return { logged: true };
+    return { logged: true, barkSession: tag };
   });
+}
+
+/**
+ * Bark session tag for a burst starting at `start`: the tag of the latest earlier burst
+ * if it ended within sessionGapMinutes, otherwise a new tag named after this start time.
+ */
+function barkSessionTag_(sh, start) {
+  const col = EPISODE_HEADERS.length;
+  if (sh.getRange(1, col).getValue() !== 'Bark session') {
+    sh.getRange(1, col).setValue('Bark session').setFontWeight('bold').setBackground('#1f2a37').setFontColor('#ffffff');
+  }
+  const gapMs = (Number(getSettings_().sessionGapMinutes) || 30) * 60000;
+  const last = sh.getLastRow();
+  if (last >= 2) {
+    const n = Math.min(200, last - 1);
+    const rows = sh.getRange(last - n + 1, 1, n, col).getValues();
+    let best = null;
+    rows.forEach(function (r) {
+      const s = r[1] instanceof Date ? r[1] : new Date(r[1]);
+      const e = r[2] instanceof Date ? r[2] : new Date(r[2]);
+      if (!(s <= start) || isNaN(e)) return;
+      if (!best || e > best.end) best = { end: e, tag: String(r[col - 1] || '') };
+    });
+    if (best && best.tag && start - best.end <= gapMs) return best.tag;
+  }
+  return 'BS ' + Utilities.formatDate(start, Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm');
 }
 
 /** Saves one audio segment (base64) into a per-episode subfolder. */
@@ -299,7 +327,8 @@ function getDashboardData_() {
       barkSeconds: Number(r[4]) || 0, density: Number(r[5]) || 0,
       peakConf: Number(r[6]) || 0, avgConf: Number(r[7]) || 0, peakDb: Number(r[8]) || 0,
       sustained: String(r[9]) === 'Yes', clipsUrl: String(r[10] || ''),
-      clipCount: Number(r[11]) || 0, device: String(r[12] || ''), notes: String(r[14] || '')
+      clipCount: Number(r[11]) || 0, device: String(r[12] || ''), notes: String(r[14] || ''),
+      barkSession: String(r[15] || '')
     };
   });
 
