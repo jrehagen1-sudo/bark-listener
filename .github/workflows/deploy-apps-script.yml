@@ -31,9 +31,9 @@ jobs:
       SCRIPT_ID: ${{ secrets.SCRIPT_ID }}
       DEPLOYMENT_ID: ${{ secrets.DEPLOYMENT_ID }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '20'
 
@@ -50,8 +50,13 @@ jobs:
 
       - name: Write clasp credentials and project config
         run: |
-          printf '%s' "$CLASPRC_JSON" > "$HOME/.clasprc.json"
+          # Copying from a terminal can add line breaks inside long tokens; JSON doesn't need any, so drop them.
+          printf '%s' "$CLASPRC_JSON" | tr -d '\r\n' > "$HOME/.clasprc.json"
           chmod 600 "$HOME/.clasprc.json"
+          node -e "JSON.parse(require('fs').readFileSync(process.env.HOME + '/.clasprc.json', 'utf8'))" || {
+            echo "::error::CLASPRC_JSON is not valid JSON. Log in again in Cloud Shell, run 'cloudshell download ~/.clasprc.json', and paste the file's contents into the secret."
+            exit 1
+          }
           printf '{"scriptId":"%s","rootDir":"apps-script"}' "$SCRIPT_ID" > .clasp.json
 
       - name: Push files to Apps Script
