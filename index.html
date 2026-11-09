@@ -100,6 +100,8 @@
       <input id="sustainedMinutes" type="number" step="1" min="1">
       <label>Keep audio for episodes at least this long (minutes)</label>
       <input id="audioMinMinutes" type="number" step="0.5" min="0">
+      <label>Also keep shorter bursts if barking returns within (minutes, 0 = off)</label>
+      <input id="shortBurstWindowMinutes" type="number" step="5" min="0">
       <label>Audio kept from start and end of each episode (minutes each)</label>
       <input id="clipMinutes" type="number" step="1" min="1" max="15">
       <div style="margin-top:12px"><button class="ghost" id="saveBtn">Save settings</button></div>
@@ -207,7 +209,32 @@
   }
 
   root.BarkEngine = BarkEngine;
+  /**
+   * Holds the audio of one short burst. If another burst starts within `windowMin`
+   * minutes after it ended, the held audio is released for saving; otherwise it expires.
+   */
+  class BurstHold {
+    constructor(windowMin) { this.w = Math.max(0, Number(windowMin) || 0) * 60000; this.item = null; }
+    /** Call for each logged episode, in order. Returns the held item it confirms, or null. */
+    confirm(ep) {
+      if (this.item && this.w > 0 && ep.start >= this.item.end && ep.start - this.item.end <= this.w) {
+        const it = this.item; this.item = null; return it;
+      }
+      return null;
+    }
+    hold(item) { if (this.w > 0) this.item = item; }
+    /** Drops the held item once its window has passed. activeStart = start of a running episode, if any. */
+    expire(now, activeStart) {
+      if (!this.item) return null;
+      const ref = activeStart != null ? activeStart : now;
+      if (ref - this.item.end > this.w) { const it = this.item; this.item = null; return it; }
+      return null;
+    }
+    clear() { const it = this.item; this.item = null; return it; }
+  }
+
   root.ClipKeeper = ClipKeeper;
+  root.BurstHold = BurstHold;
 })(typeof window !== 'undefined' ? window : globalThis);
 </script>
 <script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-audio@1.2.2/audio_bundle.js" crossorigin="anonymous"></script>
@@ -290,6 +317,7 @@
 
   let settings = null, classifier = null, stream = null, ctx = null, proc = null, source = null;
   let engine = null, keeper = null, sessionId = null, running = false;
+  let hold = new BurstHold(0);
   let recorder = null, recStart = 0, recChunks = [], rotateTimer = null, beatTimer = null, wakeLock = null;
   let currentEpisodeId = null;
   const today = { key: dayKey(Date.now()), ep: 0, sus: 0, min: 0 };
@@ -309,7 +337,7 @@
   }
 
   /* ------------------------------------------------------------ settings UI */
-  const FIELDS = ['threshold', 'gapSeconds', 'sustainedMinutes', 'clipMinutes', 'audioMinMinutes'];
+  const FIELDS = ['threshold', 'gapSeconds', 'sustainedMinutes', 'clipMinutes', 'audioMinMinutes', 'shortBurstWindowMinutes'];
   function fillSettings(s) {
     FIELDS.forEach(f => { $(f).value = s[f] === undefined ? '' : s[f]; });
     $('device').value = store.get('device', 'Android listener');
@@ -446,13 +474,31 @@
       ' <span class="pill' + (r.sustained ? ' sus' : '') + '">' + (r.sustained ? 'sustained' : 'short') + '</span></span></li>'
     ).join('');
 
+    // A held short burst is saved when this burst starts within the follow-up window.
+    const confirmed = hold.confirm(ep);
+    if (confirmed) {
+      log('Barking again within ' + holdWindowMin() + ' min — saving the earlier short burst (' + confirmed.segs.length + ' clip(s))');
+      uploadClips(confirmed.id, confirmed.segs);
+    }
+
     const audioMin = settings && settings.audioMinMinutes !== undefined ? Number(settings.audioMinMinutes) : 1;
     if (ep.durationMin >= audioMin && segs.length) {
       log('Episode ' + ep.durationMin.toFixed(1) + ' min — uploading ' + segs.length + ' clip(s)');
       uploadClips(id, segs);
+    } else if (segs.length && holdWindowMin() > 0) {
+      hold.hold({ id: id, end: ep.end, segs: segs });
+      log('Short burst (' + Math.round(ep.durationMin * 60) + ' s) — audio kept for ' + holdWindowMin() + ' min in case barking returns');
     } else {
       log('Episode logged (' + ep.durationMin.toFixed(1) + ' min), audio discarded');
     }
+  }
+
+  function holdWindowMin() {
+    return settings && settings.shortBurstWindowMinutes !== undefined ? Number(settings.shortBurstWindowMinutes) : 30;
+  }
+  function expireHold() {
+    const gone = hold.expire(Date.now(), engine && engine.active ? engine.ep.start : null);
+    if (gone) log('No more barking within ' + holdWindowMin() + ' min — short burst audio discarded');
   }
 
   /* ------------------------------------------------------- detector */
@@ -531,6 +577,7 @@
         minBarks: settings.minBarks, sustainedMinutes: settings.sustainedMinutes
       }, { onStart: onEpisodeStart, onEnd: (ep) => { onEpisodeEnd(ep).catch(e => log('Episode error: ' + e.message)); } });
       keeper = new ClipKeeper(settings.clipMinutes);
+      hold = new BurstHold(settings.shortBurstWindowMinutes !== undefined ? settings.shortBurstWindowMinutes : 30);
 
       if (ctx.state === 'suspended') await ctx.resume();
       source = ctx.createMediaStreamSource(stream);
@@ -542,7 +589,7 @@
 
       running = true; startedAt = Date.now();
       startSegment();
-      rotateTimer = setInterval(() => rotateSegment(true), SEGMENT_MS);
+      rotateTimer = setInterval(() => { rotateSegment(true); expireHold(); }, SEGMENT_MS);
       beatTimer = setInterval(() => { run('heartbeat', sessionId).catch(() => {}); flush(); }, HEARTBEAT_MS);
       await keepAwake();
       $('stopBtn').disabled = false;
@@ -564,6 +611,7 @@
     running = false;
     if (engine && engine.active) engine.finish();   // logs the open episode
     await teardown();
+    if (hold.clear()) log('Held short-burst audio discarded because monitoring stopped');
     if (sessionId) { run('stopSession', sessionId).catch(() => {}); sessionId = null; }
     setStatus('Not listening', 'Stopped at ' + fmtTime(Date.now()), '');
     $('startBtn').disabled = false;

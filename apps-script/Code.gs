@@ -28,6 +28,7 @@ const DEFAULT_SETTINGS = {
   sustainedMinutes: 5,      // episodes this long are "sustained"
   clipMinutes: 5,           // keep first N and last N minutes of audio
   audioMinMinutes: 1,       // keep audio for episodes at least this long
+  shortBurstWindowMinutes: 30, // also keep shorter bursts if barking returns within this time (0 = off)
   incessantMinutes: 30,     // ordinance: continuous barking limit
   intermittentMinutes: 60,  // ordinance: total barking limit within the window
   windowHours: 24,          // ordinance: rolling window
