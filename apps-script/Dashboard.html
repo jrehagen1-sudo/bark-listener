@@ -145,11 +145,19 @@
     </div>
     <div style="margin-top:12px"><button id="saveDetails">Save details</button><span id="msg"></span></div>
   </div>
+
+  <div class="card">
+    <h2>Old audio clips</h2>
+    <p class="muted" style="margin-top:0">Clips recorded before the MP3 update are WebM files, which iPhones can't play. This makes an MP3 copy of each one in the same folder. The originals are kept.</p>
+    <button id="convertBtn">Convert old clips to MP3</button>
+    <span id="convertMsg" class="muted" style="margin-left:8px"></span>
+  </div>
 </main>
 
 <?!= include('Report') ?>
 <script src="https://cdn.jsdelivr.net/npm/jspdf@4.2.1/dist/jspdf.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/jspdf-autotable@5.0.9/dist/jspdf.plugin.autotable.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js"></script>
 <script>
 (function () {
   'use strict';
@@ -327,6 +335,50 @@
     const doc = R.buildPdf(window.jspdf.jsPDF, stats, s);
     const d = (t) => { const x = new Date(t); return x.getFullYear() + '-' + String(x.getMonth() + 1).padStart(2, '0') + '-' + String(x.getDate()).padStart(2, '0'); };
     doc.save('Barking-Report_' + d(stats.from) + '_to_' + d(stats.to - 1) + '.pdf');
+  };
+
+  /* ---------- WebM → MP3 conversion (runs in this browser) ---------- */
+  function b64ToBytes(b64) { const s = atob(b64); const u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i); return u; }
+  function bytesToB64(chunks) {
+    let bin = '';
+    chunks.forEach(c => { for (let i = 0; i < c.length; i += 0x8000) bin += String.fromCharCode.apply(null, c.subarray(i, i + 0x8000)); });
+    return btoa(bin);
+  }
+  async function webmToMp3(bytes) {
+    // Decoding through a 16 kHz offline context also resamples to 16 kHz mono.
+    const ctx = new OfflineAudioContext(1, 1, 16000);
+    const buf = await ctx.decodeAudioData(bytes.buffer);
+    const f32 = buf.getChannelData(0);
+    const enc = new lamejs.Mp3Encoder(1, buf.sampleRate, 32), out = [];
+    const step = 16384;
+    for (let i = 0; i < f32.length; i += step) {
+      const part = f32.subarray(i, i + step), i16 = new Int16Array(part.length);
+      for (let j = 0; j < part.length; j++) { const v = Math.max(-1, Math.min(1, part[j])); i16[j] = v < 0 ? v * 0x8000 : v * 0x7fff; }
+      const b = enc.encodeBuffer(i16); if (b.length) out.push(new Uint8Array(b.buffer, b.byteOffset, b.length));
+    }
+    const tail = enc.flush(); if (tail.length) out.push(new Uint8Array(tail.buffer, tail.byteOffset, tail.length));
+    return out;
+  }
+  $('convertBtn').onclick = async () => {
+    if (!window.lamejs || !window.OfflineAudioContext) { $('convertMsg').textContent = 'This browser can\'t convert. Use Chrome on your PC.'; return; }
+    $('convertBtn').disabled = true;
+    let done = 0, failed = 0;
+    try {
+      $('convertMsg').textContent = 'Finding old clips…';
+      const list = await run('listWebmClips', API_KEY);
+      if (!list.length) { $('convertMsg').textContent = 'Nothing to convert. All clips already have MP3 copies.'; return; }
+      for (const c of list) {
+        $('convertMsg').textContent = 'Converting ' + (done + failed + 1) + ' of ' + list.length + '…';
+        try {
+          const mp3 = await webmToMp3(b64ToBytes(await run('getClipData', API_KEY, c.id)));
+          await run('saveMp3Copy', API_KEY, c.id, bytesToB64(mp3));
+          done++;
+        } catch (e) { failed++; console.error(c.name, e); }
+      }
+      $('convertMsg').textContent = 'Done: ' + done + ' converted' + (failed ? ', ' + failed + ' failed (try again)' : '') + '.';
+    } catch (e) {
+      $('convertMsg').textContent = 'Error: ' + (e.message || e);
+    } finally { $('convertBtn').disabled = false; }
   };
 
   load();

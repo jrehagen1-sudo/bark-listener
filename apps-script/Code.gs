@@ -130,6 +130,9 @@ function include(name) {
 /* Functions the dashboard calls through google.script.run (key required). */
 function getDashboardData(key) { checkKey_(key); return getDashboardData_(); }
 function saveSettings(key, s) { checkKey_(key); return saveSettings_(s); }
+function listWebmClips(key) { checkKey_(key); return listWebmClips_(); }
+function getClipData(key, fileId) { checkKey_(key); return getClipData_(fileId); }
+function saveMp3Copy(key, fileId, base64) { checkKey_(key); return saveMp3Copy_(fileId, base64); }
 
 /* ------------------------------------------------------------------ storage */
 
@@ -347,6 +350,56 @@ function getDashboardData_() {
     sheetUrl: store.ss.getUrl(), folderUrl: store.folder.getUrl(),
     generated: new Date().toISOString()
   };
+}
+
+/* ------------------------------------------------- WebM → MP3 conversion */
+
+/** WebM clips in the clips folder's episode subfolders that don't have an MP3 copy yet. */
+function listWebmClips_() {
+  const store = getStore_();
+  const out = [];
+  const subs = store.folder.getFolders();
+  while (subs.hasNext()) {
+    const sub = subs.next();
+    const names = {}, webm = [];
+    const files = sub.getFiles();
+    while (files.hasNext()) {
+      const f = files.next();
+      names[f.getName()] = true;
+      if (/\.webm$/i.test(f.getName())) webm.push(f);
+    }
+    webm.forEach(function (f) {
+      const mp3Name = f.getName().replace(/\.webm$/i, '.mp3');
+      if (!names[mp3Name]) out.push({ id: f.getId(), name: f.getName(), folder: sub.getName(), size: f.getSize() });
+    });
+  }
+  out.sort(function (a, b) { return a.name < b.name ? -1 : 1; });
+  return out;
+}
+
+function clipFileInFolder_(fileId) {
+  const f = DriveApp.getFileById(fileId);
+  const parents = f.getParents();
+  if (!parents.hasNext()) throw new Error('Clip has no folder');
+  const parent = parents.next();
+  const gp = parent.getParents();
+  if (!gp.hasNext() || gp.next().getId() !== getStore_().folder.getId()) throw new Error('Not a Bark Monitor clip');
+  return { file: f, folder: parent };
+}
+
+function getClipData_(fileId) {
+  const c = clipFileInFolder_(fileId);
+  return Utilities.base64Encode(c.file.getBlob().getBytes());
+}
+
+/** Saves an MP3 copy next to the original WebM (same name, .mp3). The original is kept. */
+function saveMp3Copy_(fileId, base64) {
+  const c = clipFileInFolder_(fileId);
+  const name = c.file.getName().replace(/\.webm$/i, '.mp3');
+  const existing = c.folder.getFilesByName(name);
+  if (existing.hasNext()) return { skipped: true, name: name };
+  c.folder.createFile(Utilities.newBlob(Utilities.base64Decode(base64), 'audio/mpeg', name));
+  return { saved: true, name: name };
 }
 
 function round_(n, d) { const p = Math.pow(10, d); return Math.round((Number(n) || 0) * p) / p; }
