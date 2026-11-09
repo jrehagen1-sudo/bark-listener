@@ -98,7 +98,9 @@
       <input id="gapSeconds" type="number" step="10" min="15">
       <label>Sustained episode length (minutes)</label>
       <input id="sustainedMinutes" type="number" step="1" min="1">
-      <label>Audio kept from start and end of sustained episodes (minutes each)</label>
+      <label>Keep audio for episodes at least this long (minutes)</label>
+      <input id="audioMinMinutes" type="number" step="0.5" min="0">
+      <label>Audio kept from start and end of each episode (minutes each)</label>
       <input id="clipMinutes" type="number" step="1" min="1" max="15">
       <div style="margin-top:12px"><button class="ghost" id="saveBtn">Save settings</button></div>
       <p class="warn">Changes apply the next time you tap Start.</p>
@@ -307,9 +309,9 @@
   }
 
   /* ------------------------------------------------------------ settings UI */
-  const FIELDS = ['threshold', 'gapSeconds', 'sustainedMinutes', 'clipMinutes'];
+  const FIELDS = ['threshold', 'gapSeconds', 'sustainedMinutes', 'clipMinutes', 'audioMinMinutes'];
   function fillSettings(s) {
-    FIELDS.forEach(f => { $(f).value = s[f]; });
+    FIELDS.forEach(f => { $(f).value = s[f] === undefined ? '' : s[f]; });
     $('device').value = store.get('device', 'Android listener');
     $('thMark').style.left = (s.threshold * 100) + '%';
   }
@@ -444,8 +446,9 @@
       ' <span class="pill' + (r.sustained ? ' sus' : '') + '">' + (r.sustained ? 'sustained' : 'short') + '</span></span></li>'
     ).join('');
 
-    if (ep.sustained && segs.length) {
-      log('Sustained episode ' + ep.durationMin.toFixed(1) + ' min — uploading ' + segs.length + ' clip(s)');
+    const audioMin = settings && settings.audioMinMinutes !== undefined ? Number(settings.audioMinMinutes) : 1;
+    if (ep.durationMin >= audioMin && segs.length) {
+      log('Episode ' + ep.durationMin.toFixed(1) + ' min — uploading ' + segs.length + ' clip(s)');
       uploadClips(id, segs);
     } else {
       log('Episode logged (' + ep.durationMin.toFixed(1) + ' min), audio discarded');
