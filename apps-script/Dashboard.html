@@ -53,6 +53,13 @@
   .wins{margin:6px 0 0;padding-left:18px;font-size:14px}
   .form h3{grid-column:1/-1;margin:8px 0 0;font-size:14px}
   #msg{font-size:13px;color:var(--ok);margin-left:8px}
+  .tlhead{display:flex;align-items:center;gap:8px}
+  .tlnav{margin-left:auto;display:flex;gap:6px}
+  .tlnav button,#tlBack{padding:6px 12px}
+  .tlnav button:disabled{opacity:.35;cursor:default}
+  .tlsvg text{font-size:13px}
+  .tlhit{cursor:pointer}
+  .tlhit:hover{fill:#1f2a37;fill-opacity:.06}
 </style>
 </head>
 <body>
@@ -84,6 +91,17 @@
   </div>
 
   <div class="kpis" id="kpis"></div>
+
+  <div class="card" id="tlCard">
+    <div class="tlhead">
+      <button id="tlBack" style="display:none">‹ Back</button>
+      <h2 id="tlTitle" style="margin:0">Barking timeline</h2>
+      <span class="tlnav" id="tlNav"><button id="tlPrev" aria-label="Previous month">‹</button><button id="tlNext" aria-label="Next month">›</button></span>
+    </div>
+    <p class="muted" id="tlSub" style="margin:4px 0 6px"></p>
+    <div id="tlChart"></div>
+    <div class="legend"><span>Line breaks when barking stops · a dot is a short bark</span><span><i style="background:var(--shade);border:1px solid var(--line)"></i>Quiet hours</span></div>
+  </div>
 
   <div class="card" id="ordCard">
     <h2>Ordinance check</h2>
@@ -293,6 +311,126 @@
     return 40 * p;
   }
 
+  /* ---------- Barking timeline: month → day → hour ---------- */
+  const MIN = 60000, HR = 3600000;
+  const now0 = new Date();
+  const tl = { y: now0.getFullYear(), m: now0.getMonth(), d: null, h: null };
+  const hShort = (h) => (h % 12 || 12) + (h < 12 ? 'a' : 'p');
+
+  function tlEpisodes() {
+    return (data ? data.episodes : []).map(e => ({ s: Date.parse(e.start), e: Date.parse(e.end) }))
+      .filter(e => isFinite(e.s) && isFinite(e.e) && e.e >= e.s);
+  }
+  /** Barking (in ms) that falls inside each of n equal slices of [from, to). */
+  function tlBins(eps, from, to, n) {
+    const size = (to - from) / n, v = new Array(n).fill(0);
+    eps.forEach(e => {
+      const a = Math.max(e.s, from), b = Math.min(e.e === e.s ? e.s + 1000 : e.e, to);
+      if (b <= a) return;
+      for (let i = Math.floor((a - from) / size); i < n && from + i * size < b; i++) {
+        const lo = from + i * size, hi = lo + size;
+        v[i] += Math.max(0, Math.min(b, hi) - Math.max(a, lo));
+      }
+    });
+    return v;
+  }
+  function tlNice(v) {
+    if (v <= 0) return 1;
+    const p = Math.pow(10, Math.floor(Math.log10(v)));
+    for (const m of [1, 2, 2.5, 5, 10]) if (m * p >= v) return m * p;
+    return 10 * p;
+  }
+
+  function tlChart(o) {
+    const W = 420, H = 230, L = 34, RT = 410, T = 10, B = 186, from = o.from, to = o.to, span = to - from;
+    const v = o.values, n = v.length, mx = o.fixedMax || tlNice(Math.max(...v, o.minMax || 0));
+    const X = (t) => L + (t - from) / span * (RT - L), Xi = (i) => L + (i + 0.5) / n * (RT - L), Y = (y) => B - y / mx * (B - T);
+    let s = '<svg class="tlsvg" viewBox="0 0 ' + W + ' ' + H + '" width="100%" role="img" aria-label="' + esc(o.aria) + '">';
+    (o.shade || []).forEach(r => { s += '<rect x="' + X(r.a) + '" y="' + T + '" width="' + (X(r.b) - X(r.a)) + '" height="' + (B - T) + '" fill="#eef0f4"/>'; });
+    (o.bands || []).forEach((b, i) => { if (i) s += '<line x1="' + X(b.a) + '" x2="' + X(b.a) + '" y1="' + T + '" y2="' + B + '" stroke="#e6e9ee"/>'; });
+    [0, 0.5, 1].forEach(f => {
+      const y = Y(mx * f);
+      s += '<line x1="' + L + '" x2="' + RT + '" y1="' + y + '" y2="' + y + '" stroke="' + (f ? '#e6e9ee' : '#9aa1aa') + '"/>';
+      s += '<text x="' + (L - 5) + '" y="' + (y + 3) + '" text-anchor="end">' + (+(mx * f).toFixed(1)) + '</text>';
+    });
+    const C = '#0b62c4';
+    let run = [];
+    const flush = () => {
+      if (!run.length) return;
+      if (run.length === 1) s += '<circle cx="' + Xi(run[0]) + '" cy="' + Y(v[run[0]]) + '" r="3" fill="' + C + '"/>';
+      else {
+        const p = run.map(i => Xi(i).toFixed(1) + ',' + Y(v[i]).toFixed(1)).join(' ');
+        s += '<polygon points="' + Xi(run[0]) + ',' + B + ' ' + p + ' ' + Xi(run[run.length - 1]) + ',' + B + '" fill="' + C + '" fill-opacity=".12"/>';
+        s += '<polyline points="' + p + '" fill="none" stroke="' + C + '" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>';
+      }
+      run = [];
+    };
+    v.forEach((y, i) => { if (y > 0.001) run.push(i); else flush(); });
+    flush();
+    o.ticks.forEach(t => { s += '<text x="' + X(t.t) + '" y="' + (B + 14) + '" text-anchor="middle">' + esc(t.label) + '</text>'; });
+    s += '<text x="' + L + '" y="' + (H - 4) + '">' + esc(o.yLabel) + '</text>';
+    (o.bands || []).forEach((b, i) => {
+      s += '<rect class="tlhit" data-i="' + i + '" x="' + X(b.a) + '" y="' + T + '" width="' + (X(b.b) - X(b.a)) + '" height="' + (B - T + 16) + '" fill="transparent"><title>' + esc(b.label) + '</title></rect>';
+    });
+    return s + '</svg>';
+  }
+
+  function quietShade(dayStart) {
+    const out = [];
+    for (let h = 0; h < 24; h++) if (R.inQuiet(h, data.settings)) out.push({ a: new Date(dayStart).setHours(h), b: new Date(dayStart).setHours(h + 1) });
+    return out;
+  }
+
+  function renderTimeline() {
+    if (!data) return;
+    const eps = tlEpisodes(), mins = (ms) => ms / MIN;
+    const fmtMin = (m) => m > 0 && m < 1 ? '<1 min' : R.fmtDur(m);
+    let o, title, sub, onPick = null;
+    if (tl.d === null) {
+      const from = new Date(tl.y, tl.m, 1).getTime(), to = new Date(tl.y, tl.m + 1, 1).getTime();
+      const nDays = new Date(tl.y, tl.m + 1, 0).getDate();
+      const raw = tlBins(eps, from, to, Math.round((to - from) / HR));
+      const bands = [];
+      for (let d = 1; d <= nDays; d++) bands.push({ a: new Date(tl.y, tl.m, d).getTime(), b: new Date(tl.y, tl.m, d + 1).getTime(), label: new Date(tl.y, tl.m, d).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }) + ' — tap to open' });
+      title = new Date(tl.y, tl.m, 1).toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+      sub = fmtMin(mins(raw.reduce((a, b) => a + b, 0))) + ' of barking this month · tap a day to open it';
+      o = { from, to, values: raw.map(mins), bands, yLabel: 'Minutes of barking per hour', minMax: 1,
+        ticks: [1, 8, 15, 22, 29].filter(d => d <= nDays).map(d => ({ t: new Date(tl.y, tl.m, d, 12).getTime(), label: (tl.m + 1) + '/' + d })),
+        aria: 'Barking per hour for ' + title };
+      onPick = (i) => { tl.d = i + 1; tl.h = null; };
+    } else if (tl.h === null) {
+      const from = new Date(tl.y, tl.m, tl.d).getTime(), to = new Date(tl.y, tl.m, tl.d + 1).getTime();
+      const raw = tlBins(eps, from, to, Math.round((to - from) / (10 * MIN)));
+      const bands = [];
+      for (let h = 0; h < 24; h++) bands.push({ a: new Date(tl.y, tl.m, tl.d, h).getTime(), b: new Date(tl.y, tl.m, tl.d, h + 1).getTime(), label: R.hourLabel(h) + ' — tap to open' });
+      title = new Date(from).toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
+      sub = fmtMin(mins(raw.reduce((a, b) => a + b, 0))) + ' of barking this day · tap an hour to open it';
+      o = { from, to, values: raw.map(mins), bands, shade: quietShade(from), yLabel: 'Minutes of barking per 10 minutes', minMax: 1,
+        ticks: [0, 6, 12, 18, 24].map(h => ({ t: new Date(tl.y, tl.m, tl.d, h).getTime(), label: hShort(h % 24) })),
+        aria: 'Barking per 10 minutes on ' + title };
+      onPick = (i) => { tl.h = i; };
+    } else {
+      const from = new Date(tl.y, tl.m, tl.d, tl.h).getTime(), to = from + HR;
+      const raw = tlBins(eps, from, to, 60);
+      const n = eps.filter(e => e.s < to && Math.max(e.e, e.s + 1000) > from).length;
+      title = new Date(from).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }) + ' · ' + R.hourLabel(tl.h) + ' to ' + R.hourLabel((tl.h + 1) % 24);
+      sub = fmtMin(mins(raw.reduce((a, b) => a + b, 0))) + ' of barking this hour · ' + n + ' burst' + (n === 1 ? '' : 's');
+      o = { from, to, values: raw.map(ms => ms / 1000), shade: R.inQuiet(tl.h, data.settings) ? [{ a: from, b: to }] : [], yLabel: 'Seconds of barking per minute', fixedMax: 60,
+        ticks: [0, 15, 30, 45, 60].map(m => ({ t: from + m * MIN, label: ':' + String(m % 60 || (m ? 60 : 0)).padStart(2, '0') })),
+        aria: 'Barking per minute, ' + title };
+    }
+    $('tlTitle').textContent = title;
+    $('tlSub').textContent = sub;
+    $('tlChart').innerHTML = tlChart(o);
+    $('tlBack').style.display = tl.d === null ? 'none' : '';
+    $('tlNav').style.display = tl.d === null ? '' : 'none';
+    $('tlNext').disabled = tl.y > now0.getFullYear() || (tl.y === now0.getFullYear() && tl.m >= now0.getMonth());
+    if (onPick) $('tlChart').querySelectorAll('.tlhit').forEach(r => { r.onclick = () => { onPick(+r.dataset.i); renderTimeline(); }; });
+  }
+  $('tlPrev').onclick = () => { tl.m--; if (tl.m < 0) { tl.m = 11; tl.y--; } renderTimeline(); };
+  $('tlNext').onclick = () => { tl.m++; if (tl.m > 11) { tl.m = 0; tl.y++; } renderTimeline(); };
+  $('tlBack').onclick = () => { if (tl.h !== null) tl.h = null; else tl.d = null; renderTimeline(); };
+
   function showLive() {
     const last = data.sessions.map(s => ({ s: s, t: Date.parse(s.lastBeat || s.start) }))
       .filter(x => isFinite(x.t)).sort((a, b) => b.t - a.t)[0];
@@ -310,7 +448,7 @@
     try {
       data = await run('getDashboardData', API_KEY);
       DETAILS.forEach(k => { $(k).value = data.settings[k]; });
-      render(); showLive(); updateListenerLink();
+      render(); renderTimeline(); showLive(); updateListenerLink();
     } catch (e) {
       $('findings').innerHTML = '<li>Could not load data: ' + esc(e.message || e) + '</li>';
     } finally { $('refresh').disabled = false; }
@@ -323,7 +461,7 @@
 
   $('saveDetails').onclick = async () => {
     const s = {}; DETAILS.forEach(k => { s[k] = $(k).value; });
-    try { data.settings = await run('saveSettings', API_KEY, s); render(); updateListenerLink(); $('msg').textContent = 'Saved'; setTimeout(() => $('msg').textContent = '', 2500); }
+    try { data.settings = await run('saveSettings', API_KEY, s); render(); renderTimeline(); updateListenerLink(); $('msg').textContent = 'Saved'; setTimeout(() => $('msg').textContent = '', 2500); }
     catch (e) { $('msg').textContent = 'Save failed: ' + (e.message || e); }
   };
 
