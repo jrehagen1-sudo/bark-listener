@@ -92,17 +92,6 @@
 
   <div class="kpis" id="kpis"></div>
 
-  <div class="card" id="tlCard">
-    <div class="tlhead">
-      <button id="tlBack" style="display:none">‹ Back</button>
-      <h2 id="tlTitle" style="margin:0">Barking timeline</h2>
-      <span class="tlnav" id="tlNav"><button id="tlPrev" aria-label="Previous month">‹</button><button id="tlNext" aria-label="Next month">›</button></span>
-    </div>
-    <p class="muted" id="tlSub" style="margin:4px 0 6px"></p>
-    <div id="tlChart"></div>
-    <div class="legend"><span>Line breaks when barking stops · a dot is a short bark</span><span><i style="background:var(--shade);border:1px solid var(--line)"></i>Quiet hours</span></div>
-  </div>
-
   <div class="card" id="ordCard">
     <h2>Ordinance check</h2>
     <div id="ord" class="muted">Loading…</div>
@@ -138,6 +127,17 @@
       <thead><tr><th>Session</th><th>Date</th><th>Start</th><th>End</th><th>Duration</th><th>Density</th><th>Peak level</th><th>Type</th><th>Audio</th></tr></thead>
       <tbody id="rows"></tbody>
     </table></div>
+  </div>
+
+  <div class="card" id="tlCard">
+    <div class="tlhead">
+      <button id="tlBack" style="display:none">‹ Back</button>
+      <h2 id="tlTitle" style="margin:0">Barking timeline</h2>
+      <span class="tlnav" id="tlNav"><button id="tlPrev" aria-label="Previous month">‹</button><button id="tlNext" aria-label="Next month">›</button></span>
+    </div>
+    <p class="muted" id="tlSub" style="margin:4px 0 6px"></p>
+    <div id="tlChart"></div>
+    <div class="legend"><span>Line breaks when barking stops · a dot is a short bark</span><span><i style="background:var(--shade);border:1px solid var(--line)"></i>Quiet hours</span></div>
   </div>
 
   <div class="card">
