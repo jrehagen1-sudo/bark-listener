@@ -248,7 +248,11 @@
     'https://storage.googleapis.com/mediapipe-models/audio_classifier/yamnet/float32/1/yamnet.tflite',
     'https://tfhub.dev/google/lite-model/yamnet/classification/tflite/1?lite-format=tflite'
   ];
-  const BARK_LABELS = { 'Bark': 1, 'Bow-wow': 1, 'Yip': 1, 'Howl': 1, 'Growling': 0.9, 'Dog': 0.9, 'Whimper (dog)': 0.8 };
+  // Only these count as barking. Generic labels like "Dog" or "Growling" also fire on voices, TV and engines.
+  const BARK_LABELS = { 'Bark': 1, 'Bow-wow': 1, 'Yip': 0.9, 'Howl': 0.8 };
+  // Dog-related labels that may score alongside a bark without counting against it.
+  const DOG_FAMILY = new Set(['Bark', 'Bow-wow', 'Yip', 'Howl', 'Dog', 'Growling', 'Whimper (dog)', 'Animal', 'Domestic animals, pets', 'Canidae, dogs, wolves']);
+  const MIN_BARK_FRAMES = 3;   // seconds of barking needed before an episode is logged
   const SEGMENT_MS = 60 * 1000;
   const HEARTBEAT_MS = 5 * 60 * 1000;
 
@@ -453,7 +457,7 @@
     currentEpisodeId = null;
     await rotateSegment(running);          // close the minute that holds the last bark
     const segs = keeper.end();
-    if (!ep.loggable) { log('Ignored a single short detection'); return; }
+    if (!ep.loggable) { log('Ignored a brief detection (under ' + engine.cfg.minBarks + ' s of barking)'); return; }
 
     const row = {
       id: id, start: new Date(ep.start).toISOString(), end: new Date(ep.end).toISOString(),
@@ -511,7 +515,7 @@
     for (const url of MODELS) {
       try {
         classifier = await MP.AudioClassifier.createFromOptions(fileset, {
-          baseOptions: { modelAssetPath: url }, maxResults: 5
+          baseOptions: { modelAssetPath: url }, maxResults: 10
         });
         return classifier;
       } catch (e) { lastErr = e; log('Model source failed, trying next'); }
@@ -519,17 +523,21 @@
     throw lastErr;
   }
 
+  /** Bark score for one frame. A frame counts only when a bark label is the strongest sound in it:
+   *  if talking, music, a vehicle, a siren or anything else scores higher, the frame is not a bark. */
   function scoreFrame(results) {
-    let bark = 0, top = '', topScore = 0;
+    let bark = 0, other = 0, otherName = '', top = '', topScore = 0;
     (results || []).forEach(r => {
       const cats = (r.classifications && r.classifications[0] && r.classifications[0].categories) || [];
       cats.forEach(c => {
         if (c.score > topScore) { topScore = c.score; top = c.categoryName; }
         const w = BARK_LABELS[c.categoryName];
         if (w) bark = Math.max(bark, c.score * w);
+        else if (!DOG_FAMILY.has(c.categoryName) && c.score > other) { other = c.score; otherName = c.categoryName; }
       });
     });
-    return { bark: bark, top: top, topScore: topScore };
+    const rejected = bark > 0 && other > bark;
+    return { bark: rejected ? 0 : bark, raw: bark, rejected: rejected, otherName: otherName, top: top, topScore: topScore };
   }
 
   function onAudio(ev) {
@@ -549,7 +557,7 @@
     $('scoreTxt').textContent = s.bark.toFixed(2);
     $('dbBar').style.width = Math.max(0, Math.min(100, (db + 90) / 90 * 100)) + '%';
     $('dbTxt').textContent = db.toFixed(0) + ' dBFS';
-    $('topTxt').textContent = s.top ? s.top + ' (' + s.topScore.toFixed(2) + ')' : '–';
+    $('topTxt').textContent = s.top ? s.top + ' (' + s.topScore.toFixed(2) + ')' + (s.rejected && s.raw >= engine.cfg.threshold ? ' · not counted, ' + s.otherName + ' louder than bark' : '') : '–';
 
     if (engine.active) {
       const ms = engine.runningMs(Date.now());
@@ -578,7 +586,7 @@
 
       engine = new BarkEngine({
         threshold: settings.threshold, gapSeconds: settings.gapSeconds,
-        minBarks: settings.minBarks, sustainedMinutes: settings.sustainedMinutes
+        minBarks: Math.max(MIN_BARK_FRAMES, Number(settings.minBarks) || 0), sustainedMinutes: settings.sustainedMinutes
       }, { onStart: onEpisodeStart, onEnd: (ep) => { onEpisodeEnd(ep).catch(e => log('Episode error: ' + e.message)); } });
       keeper = new ClipKeeper(settings.clipMinutes);
       hold = new BurstHold(settings.shortBurstWindowMinutes !== undefined ? settings.shortBurstWindowMinutes : 30);

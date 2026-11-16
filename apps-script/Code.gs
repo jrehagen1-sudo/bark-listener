@@ -24,7 +24,7 @@ const SESSION_HEADERS = [
 const DEFAULT_SETTINGS = {
   threshold: 0.25,          // minimum YAMNet score counted as a bark
   gapSeconds: 60,           // silence that ends an episode
-  minBarks: 2,              // bark-seconds needed before a cluster is logged
+  minBarks: 3,              // bark-seconds needed before a cluster is logged
   sustainedMinutes: 5,      // episodes this long are "sustained"
   clipMinutes: 5,           // keep first N and last N minutes of audio
   audioMinMinutes: 1,       // keep audio for episodes at least this long
