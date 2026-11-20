@@ -98,12 +98,7 @@
       <input id="gapSeconds" type="number" step="10" min="15">
       <label>Sustained episode length (minutes)</label>
       <input id="sustainedMinutes" type="number" step="1" min="1">
-      <label>Keep audio for episodes at least this long (minutes)</label>
-      <input id="audioMinMinutes" type="number" step="0.5" min="0">
-      <label>Also keep shorter bursts if barking returns within (minutes, 0 = off)</label>
-      <input id="shortBurstWindowMinutes" type="number" step="5" min="0">
-      <label>Audio kept from start and end of each episode (minutes each)</label>
-      <input id="clipMinutes" type="number" step="1" min="1" max="15">
+      <p class="warn">Recording: starts after 10 s of barking, saves 5-minute files while it continues, stops after 30 s of quiet. Only the first and last file of each episode are kept.</p>
       <div style="margin-top:12px"><button class="ghost" id="saveBtn">Save settings</button></div>
       <p class="warn">Changes apply the next time you tap Start.</p>
     </details>
@@ -122,8 +117,8 @@
  * Pure logic shared by the listener (and testable on its own).
  *
  * BarkEngine   groups ~1-second detection frames into episodes.
- * ClipKeeper   decides which 1-minute audio segments to keep for an episode:
- *              the minute before it started, the first N minutes, and the last N minutes.
+ * ClipKeeper   keeps only the first and the last recording file of an episode.
+ * RecGate      decides when to record: start after 10 s of barking, stop after 30 s of quiet.
  */
 (function (root) {
   'use strict';
@@ -184,29 +179,49 @@
   }
 
   class ClipKeeper {
-    constructor(clipMinutes) { this.n = clipMinutes || 5; this.reset(); this.preroll = null; }
-    reset() { this.active = false; this.first = []; this.last = []; }
-    setMinutes(n) { this.n = n; }
-    begin() {
-      this.active = true;
-      this.first = this.preroll ? [this.preroll] : [];
-      this.last = [];
-      this.preroll = null;
-    }
-    /** seg = {start, end, blob} — one finished 1-minute recording */
+    constructor() { this.reset(); }
+    reset() { this.active = false; this.first = null; this.last = null; }
+    begin() { this.active = true; this.first = null; this.last = null; }
+    /** seg = {start, end, blob} — one finished recording file (up to 5 minutes) */
     add(seg) {
-      if (!this.active) { this.preroll = seg; return; }
-      if (this.first.length < this.n + 1) { this.first.push(seg); return; }
-      this.last.push(seg);
-      if (this.last.length > this.n) this.last.shift();
+      if (!this.active) return;
+      if (!this.first) this.first = seg; else this.last = seg;
     }
-    /** Returns the segments to keep and goes idle. */
+    /** Returns the files to keep (first and last) and goes idle. */
     end() {
-      const keep = this.first.concat(this.last);
+      const keep = [this.first, this.last].filter(Boolean);
       this.reset();
       return keep;
     }
   }
+
+  /**
+   * Recording rules: start once `startSec` seconds of barking have been heard
+   * (those seconds are not recorded); stop after `stopSec` seconds with no bark.
+   * Bark seconds reset when a quiet gap of `stopSec` passes before recording starts.
+   * feed() returns 'start', 'stop' or null.
+   */
+  class RecGate {
+    constructor(startSec, stopSec) { this.startMs = startSec * 1000; this.stopMs = stopSec * 1000; this.reset(); }
+    reset() { this.rec = false; this.barkMs = 0; this.lastBark = null; }
+    feed(t, isBark, frameMs) {
+      if (isBark) {
+        if (this.lastBark !== null && t - this.lastBark >= this.stopMs) this.barkMs = 0;
+        this.lastBark = t + frameMs;
+        if (!this.rec) {
+          this.barkMs += frameMs;
+          if (this.barkMs >= this.startMs) { this.rec = true; return 'start'; }
+        }
+        return null;
+      }
+      if (this.lastBark !== null && t + frameMs - this.lastBark >= this.stopMs) {
+        this.barkMs = 0;
+        if (this.rec) { this.rec = false; return 'stop'; }
+      }
+      return null;
+    }
+  }
+  root.RecGate = RecGate;
 
   root.BarkEngine = BarkEngine;
   /**
@@ -253,7 +268,9 @@
   // Dog-related labels that may score alongside a bark without counting against it.
   const DOG_FAMILY = new Set(['Bark', 'Bow-wow', 'Yip', 'Howl', 'Dog', 'Growling', 'Whimper (dog)', 'Animal', 'Domestic animals, pets', 'Canidae, dogs, wolves']);
   const MIN_BARK_FRAMES = 3;   // seconds of barking needed before an episode is logged
-  const SEGMENT_MS = 60 * 1000;
+  const START_BARK_SEC = 10;   // seconds of barking before recording starts (not recorded)
+  const STOP_QUIET_SEC = 30;   // seconds of quiet that stop a recording
+  const FILE_MINUTES = 5;      // length of each recording file while barking continues
   const HEARTBEAT_MS = 5 * 60 * 1000;
 
   const $ = (id) => document.getElementById(id);
@@ -321,9 +338,8 @@
   };
 
   let settings = null, classifier = null, stream = null, ctx = null, proc = null, source = null;
-  let engine = null, keeper = null, sessionId = null, running = false;
-  let hold = new BurstHold(0);
-  let mp3 = null, rotateTimer = null, beatTimer = null, wakeLock = null;
+  let engine = null, keeper = null, gate = null, sessionId = null, running = false;
+  let mp3 = null, beatTimer = null, wakeLock = null;
   let currentEpisodeId = null;
   const today = { key: dayKey(Date.now()), ep: 0, sus: 0, min: 0 };
   const recent = [];
@@ -342,7 +358,7 @@
   }
 
   /* ------------------------------------------------------------ settings UI */
-  const FIELDS = ['threshold', 'gapSeconds', 'sustainedMinutes', 'clipMinutes', 'audioMinMinutes', 'shortBurstWindowMinutes'];
+  const FIELDS = ['threshold', 'gapSeconds', 'sustainedMinutes'];
   function fillSettings(s) {
     FIELDS.forEach(f => { $(f).value = s[f] === undefined ? '' : s[f]; });
     $('device').value = store.get('device', 'Android listener');
@@ -417,8 +433,8 @@
     });
   }
 
-  /* ------------------------------------------------------- 1-minute recorder (MP3) */
-  // Audio is encoded to MP3 from the same samples the detector hears, one file per minute.
+  /* ------------------------------------------------------- recorder (MP3) */
+  // Audio is encoded to MP3 from the same samples the detector hears, only while recording.
   // MP3 plays everywhere (iPhone, Windows, email), unlike Chrome's WebM recordings.
   function startSegment() {
     mp3 = { enc: new lamejs.Mp3Encoder(1, ctx.sampleRate, 32), chunks: [], start: Date.now() };
@@ -433,29 +449,34 @@
     const out = mp3.enc.encodeBuffer(i16);
     if (out.length) mp3.chunks.push(new Uint8Array(out.buffer, out.byteOffset, out.length));
   }
-  /** Finishes the current minute of audio, hands it to the ClipKeeper, starts the next. */
-  function rotateSegment(restart) {
+  /** Closes the current recording file and hands it to the ClipKeeper. */
+  function closeSegment() {
     const seg = mp3;
     mp3 = null;
-    if (seg) {
-      const tail = seg.enc.flush();
-      if (tail.length) seg.chunks.push(new Uint8Array(tail.buffer, tail.byteOffset, tail.length));
-      if (seg.chunks.length) keeper.add({ start: seg.start, end: Date.now(), blob: new Blob(seg.chunks, { type: 'audio/mpeg' }) });
-    }
-    if (restart && running) startSegment();
-    return Promise.resolve();
+    if (!seg) return;
+    const tail = seg.enc.flush();
+    if (tail.length) seg.chunks.push(new Uint8Array(tail.buffer, tail.byteOffset, tail.length));
+    if (seg.chunks.length) keeper.add({ start: seg.start, end: Date.now(), blob: new Blob(seg.chunks, { type: 'audio/mpeg' }) });
+  }
+  /** Runs after each audio frame: starts, splits (every 5 min) and stops recordings. */
+  function recordStep(t, isBark, frameMs) {
+    const act = gate.feed(t, isBark, frameMs);
+    if (act === 'start') { startSegment(); log('Recording started (' + START_BARK_SEC + ' s of barking heard)'); }
+    else if (act === 'stop') { closeSegment(); log('Recording stopped (' + STOP_QUIET_SEC + ' s of quiet)'); }
+    else if (mp3 && Date.now() - mp3.start >= FILE_MINUTES * 60000) { closeSegment(); startSegment(); }
   }
 
   /* ------------------------------------------------------- episodes */
   function onEpisodeStart(e) {
     currentEpisodeId = 'E' + new Date(e.start).toISOString().replace(/[-:T]/g, '').slice(0, 14) + '-' + Math.random().toString(36).slice(2, 6);
     keeper.begin();
-    log('Barking started');
+    log('Barking started (logging)');
   }
   async function onEpisodeEnd(ep) {
     const id = currentEpisodeId;
     currentEpisodeId = null;
-    await rotateSegment(running);          // close the minute that holds the last bark
+    closeSegment();                        // safety: recording normally stopped 30 s after the last bark
+    gate.reset();
     const segs = keeper.end();
     if (!ep.loggable) { log('Ignored a brief detection (under ' + engine.cfg.minBarks + ' s of barking)'); return; }
 
@@ -480,31 +501,12 @@
       ' <span class="pill' + (r.sustained ? ' sus' : '') + '">' + (r.sustained ? 'sustained' : 'short') + '</span></span></li>'
     ).join('');
 
-    // A held short burst is saved when this burst starts within the follow-up window.
-    const confirmed = hold.confirm(ep);
-    if (confirmed) {
-      log('Barking again within ' + holdWindowMin() + ' min — saving the earlier short burst (' + confirmed.segs.length + ' clip(s))');
-      uploadClips(confirmed.id, confirmed.segs);
-    }
-
-    const audioMin = settings && settings.audioMinMinutes !== undefined ? Number(settings.audioMinMinutes) : 1;
-    if (ep.durationMin >= audioMin && segs.length) {
-      log('Episode ' + ep.durationMin.toFixed(1) + ' min — uploading ' + segs.length + ' clip(s)');
+    if (segs.length) {
+      log('Episode ' + ep.durationMin.toFixed(1) + ' min — uploading ' + segs.length + ' file(s) (first and last)');
       uploadClips(id, segs);
-    } else if (segs.length && holdWindowMin() > 0) {
-      hold.hold({ id: id, end: ep.end, segs: segs });
-      log('Short burst (' + Math.round(ep.durationMin * 60) + ' s) — audio kept for ' + holdWindowMin() + ' min in case barking returns');
     } else {
-      log('Episode logged (' + ep.durationMin.toFixed(1) + ' min), audio discarded');
+      log('Episode logged (' + ep.durationMin.toFixed(1) + ' min), no recording (under ' + START_BARK_SEC + ' s of barking)');
     }
-  }
-
-  function holdWindowMin() {
-    return settings && settings.shortBurstWindowMinutes !== undefined ? Number(settings.shortBurstWindowMinutes) : 30;
-  }
-  function expireHold() {
-    const gone = hold.expire(Date.now(), engine && engine.active ? engine.ep.start : null);
-    if (gone) log('No more barking within ' + holdWindowMin() + ' min — short burst audio discarded');
   }
 
   /* ------------------------------------------------------- detector */
@@ -552,6 +554,7 @@
     catch (e) { log('Classify error: ' + e.message); return; }
 
     engine.feed(t, s.bark, db);
+    recordStep(t, s.bark >= engine.cfg.threshold, engine.cfg.frameSec * 1000);
 
     $('scoreBar').style.width = Math.min(100, s.bark * 100) + '%';
     $('scoreTxt').textContent = s.bark.toFixed(2);
@@ -588,8 +591,8 @@
         threshold: settings.threshold, gapSeconds: settings.gapSeconds,
         minBarks: Math.max(MIN_BARK_FRAMES, Number(settings.minBarks) || 0), sustainedMinutes: settings.sustainedMinutes
       }, { onStart: onEpisodeStart, onEnd: (ep) => { onEpisodeEnd(ep).catch(e => log('Episode error: ' + e.message)); } });
-      keeper = new ClipKeeper(settings.clipMinutes);
-      hold = new BurstHold(settings.shortBurstWindowMinutes !== undefined ? settings.shortBurstWindowMinutes : 30);
+      keeper = new ClipKeeper();
+      gate = new RecGate(START_BARK_SEC, STOP_QUIET_SEC);
 
       if (ctx.state === 'suspended') await ctx.resume();
       source = ctx.createMediaStreamSource(stream);
@@ -600,8 +603,6 @@
       proc.connect(ctx.destination);
 
       running = true; startedAt = Date.now();
-      startSegment();
-      rotateTimer = setInterval(() => { rotateSegment(true); expireHold(); }, SEGMENT_MS);
       beatTimer = setInterval(() => { run('heartbeat', sessionId).catch(() => {}); flush(); }, HEARTBEAT_MS);
       await keepAwake();
       $('stopBtn').disabled = false;
@@ -623,7 +624,6 @@
     running = false;
     if (engine && engine.active) engine.finish();   // logs the open episode
     await teardown();
-    if (hold.clear()) log('Held short-burst audio discarded because monitoring stopped');
     if (sessionId) { run('stopSession', sessionId).catch(() => {}); sessionId = null; }
     setStatus('Not listening', 'Stopped at ' + fmtTime(Date.now()), '');
     $('startBtn').disabled = false;
@@ -631,7 +631,7 @@
   }
 
   async function teardown() {
-    clearInterval(rotateTimer); clearInterval(beatTimer);
+    clearInterval(beatTimer);
     try { if (proc) proc.disconnect(); if (source) source.disconnect(); } catch (e) {}
     try { if (ctx) await ctx.close(); } catch (e) {}
     if (stream) stream.getTracks().forEach(t => t.stop());
