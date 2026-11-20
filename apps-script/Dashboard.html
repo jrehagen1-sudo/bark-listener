@@ -172,12 +172,10 @@
   </div>
 
   <div class="card">
-    <h2>Remove clips without barking</h2>
-    <p class="muted" style="margin-top:0">Listens to the first 10 seconds of every clip with the same bark detector the Listener uses. Clips with no bark in that time are listed, then moved to the Drive trash when you tap the button (restorable for 30 days). Keep this screen on while it runs.</p>
-    <button id="scanBtn">Check clips</button>
+    <h2>Delete clips without barking</h2>
+    <p class="muted" style="margin-top:0">Google's bark detector (the same one the Listener uses) listens to the first 10 seconds of every clip. Clips with no bark in that time, and clips that won't play, go straight to the Drive trash (restorable for 30 days). Keep this screen on while it runs.</p>
+    <button id="scanBtn">Delete clips without barking</button>
     <span id="scanMsg" class="muted" style="margin-left:8px"></span>
-    <div id="scanList" style="margin-top:10px"></div>
-    <button id="trashBtn" style="display:none;margin-top:10px"></button>
   </div>
 </main>
 
@@ -185,7 +183,6 @@
 <script src="https://cdn.jsdelivr.net/npm/jspdf@4.2.1/dist/jspdf.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/jspdf-autotable@5.0.9/dist/jspdf.plugin.autotable.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-audio@1.2.2/audio_bundle.js" crossorigin="anonymous"></script>
 <script>
 (function () {
   'use strict';
@@ -530,8 +527,9 @@
   };
 
   /* ---------- No-bark clip cleanup (runs in this browser) ---------- */
-  const MPA = window.Audio && window.Audio.AudioClassifier ? window.Audio : null;
-  const MP_WASM = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-audio@1.2.2/wasm';
+  // MediaPipe 0.10.32: newer versions need WebAssembly features Safari doesn't have.
+  const MP_VER = '0.10.32';
+  const MP_BASE = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-audio@' + MP_VER;
   const MP_MODELS = [
     'https://storage.googleapis.com/mediapipe-models/audio_classifier/yamnet/float32/1/yamnet.tflite',
     'https://tfhub.dev/google/lite-model/yamnet/classification/tflite/1?lite-format=tflite'
@@ -540,14 +538,16 @@
   const BARK_LABELS = { 'Bark': 1, 'Bow-wow': 1, 'Yip': 0.9, 'Howl': 0.8 };
   const DOG_FAMILY = new Set(['Bark', 'Bow-wow', 'Yip', 'Howl', 'Dog', 'Growling', 'Whimper (dog)', 'Animal', 'Domestic animals, pets', 'Canidae, dogs, wolves']);
   const CHECK_SEC = 10;
-  let barkModel = null, noBark = [];
+  let barkModel = null;
 
   async function loadBarkModel() {
     if (barkModel) return barkModel;
-    const fileset = await MPA.FilesetResolver.forAudioTasks(MP_WASM);
+    const mod = await import(MP_BASE + '/audio_bundle.mjs');
+    const FR = mod.FilesetResolver || window.FilesetResolver;
+    const fileset = await FR.forAudioTasks(MP_BASE + '/wasm');
     let lastErr;
     for (const url of MP_MODELS) {
-      try { barkModel = await MPA.AudioClassifier.createFromOptions(fileset, { baseOptions: { modelAssetPath: url }, maxResults: 10 }); return barkModel; }
+      try { barkModel = await mod.AudioClassifier.createFromOptions(fileset, { baseOptions: { modelAssetPath: url }, maxResults: 10 }); return barkModel; }
       catch (e) { lastErr = e; }
     }
     throw lastErr;
@@ -561,17 +561,23 @@
     });
     return other > bark ? 0 : bark;
   }
-  /** Highest bark score in the first 10 seconds of the clip (one score per ~1 s frame). */
-  async function firstSecondsBark(bytes, threshold) {
-    const ctx = new OfflineAudioContext(1, 1, 16000);
-    const buf = await ctx.decodeAudioData(bytes.buffer);
-    const pcm = buf.getChannelData(0).slice(0, Math.min(buf.length, buf.sampleRate * CHECK_SEC));
-    const step = Math.round(buf.sampleRate * 0.975);
+  /** First 10 seconds of the clip as mono samples, or null if the audio won't play. */
+  async function decodeStart(bytes) {
+    try {
+      const ctx = new OfflineAudioContext(1, 1, 44100);
+      const buf = await ctx.decodeAudioData(bytes.buffer);
+      if (!buf || buf.duration < 0.5) return null;
+      return { pcm: buf.getChannelData(0).slice(0, Math.min(buf.length, buf.sampleRate * CHECK_SEC)), rate: buf.sampleRate };
+    } catch (e) { return null; }
+  }
+  /** Highest bark score in the samples (one score per ~1 s frame). */
+  function barkScore(a, threshold) {
+    const step = Math.round(a.rate * 0.975);
     let best = 0;
-    for (let i = 0; i < pcm.length; i += step) {
-      const part = pcm.slice(i, i + step);
+    for (let i = 0; i < a.pcm.length; i += step) {
+      const part = a.pcm.slice(i, i + step);
       if (part.length < step / 4) break;
-      (barkModel.classify(part, buf.sampleRate) || []).forEach(r => {
+      (barkModel.classify(part, a.rate) || []).forEach(r => {
         const cats = (r.classifications && r.classifications[0] && r.classifications[0].categories) || [];
         best = Math.max(best, frameBark(cats));
       });
@@ -579,11 +585,16 @@
     }
     return best;
   }
+  async function fetchClip(id) {
+    try { return b64ToBytes(await run('getClipData', API_KEY, id)); }
+    catch (e) { return b64ToBytes(await run('getClipData', API_KEY, id)); } // one retry
+  }
+
   $('scanBtn').onclick = async () => {
-    if (!MPA || !window.OfflineAudioContext) { $('scanMsg').textContent = 'The bark detector did not load. Check your connection and refresh.'; return; }
-    $('scanBtn').disabled = true; $('trashBtn').style.display = 'none'; $('scanList').innerHTML = ''; noBark = [];
+    if (!window.OfflineAudioContext) { $('scanMsg').textContent = 'This browser can\'t read audio.'; return; }
+    $('scanBtn').disabled = true;
     const threshold = Number(data && data.settings && data.settings.threshold) || 0.25;
-    let barked = 0, failed = 0;
+    let kept = 0, noBark = 0, broken = 0, skipped = 0, playedOk = 0;
     try {
       $('scanMsg').textContent = 'Loading bark detector…';
       await loadBarkModel();
@@ -592,35 +603,27 @@
       if (!list.length) { $('scanMsg').textContent = 'No clips found.'; return; }
       for (let n = 0; n < list.length; n++) {
         const c = list[n];
-        $('scanMsg').textContent = 'Checking ' + (n + 1) + ' of ' + list.length + '…';
-        try {
-          const score = await firstSecondsBark(b64ToBytes(await run('getClipData', API_KEY, c.checkId)), threshold);
-          if (score >= threshold) barked++; else noBark.push(c);
-        } catch (e) { failed++; console.error(c.name, e); }
+        $('scanMsg').textContent = 'Clip ' + (n + 1) + ' of ' + list.length + ' · deleted ' + (noBark + broken) + ', kept ' + kept;
+        let bytes;
+        try { bytes = await fetchClip(c.checkId); } catch (e) { skipped++; continue; } // Drive hiccup: leave it alone
+        const audio = await decodeStart(bytes);
+        if (!audio) {
+          // Safety stop: if nothing has played yet, the problem is this browser, not the clips.
+          if (!playedOk && broken >= 2) throw new Error('This browser couldn\'t play the first clips, so nothing more was deleted. Try Chrome on your PC.');
+          broken++;
+          await run('trashClips', API_KEY, c.ids);
+          continue;
+        }
+        playedOk++;
+        if (barkScore(audio, threshold) >= threshold) { kept++; continue; }
+        noBark++;
+        await run('trashClips', API_KEY, c.ids);
       }
-      $('scanMsg').textContent = list.length + ' checked: ' + barked + ' with barking, ' + noBark.length + ' without' + (failed ? ', ' + failed + ' could not be read (kept)' : '') + '.';
-      if (noBark.length) {
-        $('scanList').innerHTML = '<div class="muted">No bark in the first 10 seconds (tap a name to listen):</div>' + noBark.map(c =>
-          '<div><a target="_blank" href="https://drive.google.com/file/d/' + encodeURIComponent(c.checkId) + '/view">' + esc(c.name) + '</a> <span class="muted">' + esc(c.folder) + '</span></div>').join('');
-        $('trashBtn').textContent = 'Move ' + noBark.length + ' clips to trash';
-        $('trashBtn').style.display = '';
-      }
+      $('scanMsg').textContent = 'Done. Deleted ' + noBark + ' with no barking' + (broken ? ' and ' + broken + ' that wouldn\'t play' : '') +
+        ', kept ' + kept + ' with barking' + (skipped ? ', ' + skipped + ' couldn\'t be downloaded (run again)' : '') + '. Deleted clips stay in the Drive trash for 30 days.';
     } catch (e) {
-      $('scanMsg').textContent = 'Error: ' + (e.message || e);
+      $('scanMsg').textContent = 'Stopped: ' + (e.message || e) + ' (Deleted ' + (noBark + broken) + ', kept ' + kept + ' so far.)';
     } finally { $('scanBtn').disabled = false; }
-  };
-  $('trashBtn').onclick = async () => {
-    if (!noBark.length) return;
-    $('trashBtn').disabled = true;
-    try {
-      const ids = [].concat.apply([], noBark.map(c => c.ids));
-      let done = 0;
-      for (let i = 0; i < ids.length; i += 20) { done += (await run('trashClips', API_KEY, ids.slice(i, i + 20))).trashed; }
-      $('scanMsg').textContent = noBark.length + ' clips moved to the Drive trash (' + done + ' files). Restore them from Drive\'s trash within 30 days if needed.';
-      $('scanList').innerHTML = ''; $('trashBtn').style.display = 'none'; noBark = [];
-    } catch (e) {
-      $('scanMsg').textContent = 'Error while trashing: ' + (e.message || e);
-    } finally { $('trashBtn').disabled = false; }
   };
 
   load();
