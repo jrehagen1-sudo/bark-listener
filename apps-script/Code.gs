@@ -133,6 +133,8 @@ function saveSettings(key, s) { checkKey_(key); return saveSettings_(s); }
 function listWebmClips(key) { checkKey_(key); return listWebmClips_(); }
 function getClipData(key, fileId) { checkKey_(key); return getClipData_(fileId); }
 function saveMp3Copy(key, fileId, base64) { checkKey_(key); return saveMp3Copy_(fileId, base64); }
+function listAudioClips(key) { checkKey_(key); return listAudioClips_(); }
+function trashClips(key, ids) { checkKey_(key); return trashClips_(ids); }
 
 /* ------------------------------------------------------------------ storage */
 
@@ -400,6 +402,43 @@ function saveMp3Copy_(fileId, base64) {
   if (existing.hasNext()) return { skipped: true, name: name };
   c.folder.createFile(Utilities.newBlob(Utilities.base64Decode(base64), 'audio/mpeg', name));
   return { saved: true, name: name };
+}
+
+/* ------------------------------------------------- No-bark clip cleanup */
+
+/** Every recording in the episode subfolders. A WebM and its MP3 copy count as one clip
+ *  (checkId is the file the browser analyzes: the MP3 when there is one). */
+function listAudioClips_() {
+  const store = getStore_();
+  const out = [];
+  const subs = store.folder.getFolders();
+  while (subs.hasNext()) {
+    const sub = subs.next();
+    const groups = {};
+    const files = sub.getFiles();
+    while (files.hasNext()) {
+      const f = files.next(), m = f.getName().match(/^(.*)\.(mp3|webm)$/i);
+      if (!m) continue;
+      const g = groups[m[1]] || (groups[m[1]] = { name: m[1], folder: sub.getName(), ids: [], checkId: '', isMp3: false });
+      g.ids.push(f.getId());
+      if (/mp3/i.test(m[2])) { g.checkId = f.getId(); g.isMp3 = true; }
+      else if (!g.isMp3) g.checkId = f.getId();
+    }
+    Object.keys(groups).forEach(function (k) { out.push(groups[k]); });
+  }
+  out.sort(function (a, b) { return a.name < b.name ? -1 : 1; });
+  return out;
+}
+
+/** Moves clips to the Drive trash (restorable for 30 days). Only Bark Monitor clips are accepted. */
+function trashClips_(ids) {
+  let trashed = 0;
+  (ids || []).forEach(function (id) {
+    const c = clipFileInFolder_(id);
+    c.file.setTrashed(true);
+    trashed++;
+  });
+  return { trashed: trashed };
 }
 
 function round_(n, d) { const p = Math.pow(10, d); return Math.round((Number(n) || 0) * p) / p; }
