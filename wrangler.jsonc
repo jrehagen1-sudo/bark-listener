@@ -1,12 +1,17 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "bark-listener",
+  "main": "src/worker.js",
   "compatibility_date": "2026-11-23",
+  "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
-  "observability": {
-    "enabled": true
-  },
-  "assets": {
-    "directory": "."
-  }
+  "preview_urls": false,
+  "observability": { "enabled": true },
+  // index.html (the Listener) and cf/app.html are the only files served; see .assetsignore.
+  "assets": { "directory": ".", "binding": "ASSETS", "run_worker_first": true },
+  // Created automatically on the first deploy.
+  "d1_databases": [{ "binding": "DB", "database_name": "bark-meter" }],
+  "r2_buckets": [{ "binding": "CLIPS", "bucket_name": "bark-clips" }],
+  // Two-way sync with the Google Sheet and Drive.
+  "triggers": { "crons": ["*/5 * * * *"] }
 }

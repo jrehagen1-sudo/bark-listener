@@ -1,2 +1,5 @@
 .clasp.json
 .clasprc.json
+.dev.vars
+.wrangler
+node_modules

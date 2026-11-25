@@ -114,6 +114,12 @@ function doPost(e) {
       case 'episode':   out = logEpisode_(req.episode); break;
       case 'clip':      out = saveClip_(req.episodeId, req.fileName, req.data, req.mimeType); break;
       case 'ping':      out = 'pong'; break;
+      // Two-way sync with the Cloudflare demo (called by the Cloudflare Worker every 5 minutes).
+      case 'syncPull':     out = syncPull_(Number(req.since) || 0, String(req.ownerEmail || '')); break;
+      case 'syncPush':     out = syncPush_(req); break;
+      case 'syncClipList': out = syncClipList_(Number(req.since) || 0); break;
+      case 'syncClipGet':  out = syncClipGet_(req.fileId); break;
+      case 'syncClipUp':   out = syncClipUp_(req); break;
       default: throw new Error('Unknown action: ' + req.action);
     }
     out = { ok: true, result: out };
@@ -442,3 +448,281 @@ function trashClips_(ids) {
 }
 
 function round_(n, d) { const p = Math.pow(10, d); return Math.round((Number(n) || 0) * p) / p; }
+
+/* ======================================================= Cloudflare sync
+ * The Cloudflare Worker calls these every 5 minutes (see src/worker.js).
+ * Each synced tab gets two hidden columns: "Updated" (ms) and "Sync hash". A row whose hash no
+ * longer matches was edited in the Sheet, so it is stamped and sent to Cloudflare on the next pull.
+ */
+
+const SHEET_T_EPISODES = 'Tester Episodes';
+const SHEET_T_SESSIONS = 'Tester Sessions';
+const SHEET_FEEDBACK = 'Feedback';
+const SHEET_TESTERS = 'Testers';
+const SYNC_HEADERS = ['Updated', 'Sync hash'];
+
+const SYNC_SPECS = {
+  episodes: {
+    fields: ['id', 'start', 'end', 'durationMin', 'barkSeconds', 'density', 'peakConf', 'avgConf', 'peakDb',
+      'sustained', 'clipsUrl', 'clipCount', 'device', 'sessionId', 'notes', 'barkSession'],
+    headers: EPISODE_HEADERS, dates: ['start', 'end'], bools: ['sustained'],
+    sheetOwned: ['clipsUrl', 'clipCount'],   // set here when clips are saved; never overwritten from Cloudflare
+    key: 'id', owner: SHEET_EPISODES, tester: SHEET_T_EPISODES
+  },
+  sessions: {
+    fields: ['id', 'device', 'started', 'lastBeat', 'stopped', 'status'], headers: SESSION_HEADERS,
+    dates: ['started', 'lastBeat', 'stopped'], bools: [], sheetOwned: [],
+    key: 'id', owner: SHEET_SESSIONS, tester: SHEET_T_SESSIONS
+  },
+  feedback: {
+    fields: ['id', 'user', 'created', 'kind', 'message', 'page', 'status', 'reply'],
+    headers: ['ID', 'User', 'Created', 'Type', 'Message', 'Page', 'Status', 'Reply'],
+    dates: ['created'], bools: [], sheetOwned: [], key: 'id', all: SHEET_FEEDBACK
+  },
+  users: {
+    fields: ['email', 'name', 'role', 'active', 'created', 'lastLogin'],
+    headers: ['Email', 'Name', 'Role', 'Active', 'Created', 'Last login'],
+    dates: ['created', 'lastLogin'], bools: ['active'], sheetOwned: [], key: 'email', all: SHEET_TESTERS
+  }
+};
+
+function syncLayouts_(spec) {
+  const list = [];
+  if (spec.all) list.push({ name: spec.all, userCol: false, kind: 'all' });
+  if (spec.owner) list.push({ name: spec.owner, userCol: false, kind: 'owner' });
+  if (spec.tester) list.push({ name: spec.tester, userCol: true, kind: 'tester' });
+  return list;
+}
+
+function pickLayout_(spec, o, ownerEmail) {
+  const lays = syncLayouts_(spec);
+  if (spec.all) return lays[0];
+  const own = String(o.user || '').toLowerCase() === ownerEmail;
+  return lays.filter(function (l) { return l.kind === (own ? 'owner' : 'tester'); })[0];
+}
+
+/** Opens (or creates) a synced tab and makes sure its two hidden sync columns exist. */
+function syncTab_(ss, spec, lay) {
+  const headers = (lay.userCol ? ['User'] : []).concat(spec.headers);
+  const n = headers.length;
+  const sh = ensureSheet_(ss, lay.name, headers.concat(SYNC_HEADERS));
+  if (sh.getMaxColumns() < n + 2) sh.insertColumnsAfter(sh.getMaxColumns(), n + 2 - sh.getMaxColumns());
+  const cur = sh.getRange(1, n + 1, 1, 2).getValues()[0];
+  if (cur[0] !== SYNC_HEADERS[0] || cur[1] !== SYNC_HEADERS[1]) {
+    sh.getRange(1, n + 1, 1, 2).setValues([SYNC_HEADERS])
+      .setFontWeight('bold').setBackground('#1f2a37').setFontColor('#ffffff');
+  }
+  if (!sh.isColumnHiddenByUser(n + 1)) sh.hideColumns(n + 1, 2);
+  return { sh: sh, n: n, lay: lay, keyIdx: (lay.userCol ? 1 : 0) + spec.fields.indexOf(spec.key) };
+}
+
+function keyIndex_(t) {
+  const idx = {};
+  const last = t.sh.getLastRow();
+  if (last >= 2) {
+    t.sh.getRange(2, t.keyIdx + 1, last - 1, 1).getValues().forEach(function (r, i) {
+      const k = String(r[0] || '').trim();
+      if (k) idx[k] = i + 2;
+    });
+  }
+  return idx;
+}
+
+function rowHash_(vals) {
+  const s = JSON.stringify(vals.map(function (v) { return v instanceof Date ? v.toISOString() : v; }));
+  return Utilities.base64Encode(Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, s, Utilities.Charset.UTF_8));
+}
+
+function rowToObj_(spec, t, r, ownerEmail) {
+  const o = {};
+  const off = t.lay.userCol ? 1 : 0;
+  spec.fields.forEach(function (f, i) {
+    let v = r[off + i];
+    if (spec.dates.indexOf(f) >= 0) v = v instanceof Date ? v.toISOString() : (v ? String(v) : '');
+    else if (spec.bools.indexOf(f) >= 0) v = /^(yes|true|1)$/i.test(String(v));
+    else if (v instanceof Date) v = v.toISOString();
+    o[f] = v;
+  });
+  if (t.lay.userCol) o.user = String(r[0] || '').trim().toLowerCase();
+  else if (t.lay.kind === 'owner') o.user = ownerEmail;
+  return o;
+}
+
+function objToRow_(spec, t, o) {
+  const vals = t.lay.userCol ? [String(o.user || '')] : [];
+  spec.fields.forEach(function (f) {
+    let v = o[f];
+    if (spec.dates.indexOf(f) >= 0) { const d = v ? new Date(v) : null; v = d && !isNaN(d) ? d : ''; }
+    else if (spec.bools.indexOf(f) >= 0) v = v ? 'Yes' : 'No';
+    else if (v === null || v === undefined) v = '';
+    if (typeof v === 'string' && /^[=+\-@]/.test(v)) v = "'" + v;   // tester text never becomes a formula
+    vals.push(v);
+  });
+  return vals;
+}
+
+/** Rows added or edited in the Sheet since `since` (ms), plus the owner's settings. */
+function syncPull_(since, ownerEmail) {
+  ownerEmail = String(ownerEmail || '').toLowerCase();
+  return withLock_(function () {
+    const ss = getStore_().ss;
+    const now = Date.now();
+    const rows = {};
+    Object.keys(SYNC_SPECS).forEach(function (k) {
+      const spec = SYNC_SPECS[k];
+      rows[k] = [];
+      syncLayouts_(spec).forEach(function (lay) {
+        if (lay.kind === 'owner' && !ownerEmail) return;
+        const t = syncTab_(ss, spec, lay);
+        const last = t.sh.getLastRow();
+        if (last < 2) return;
+        const vals = t.sh.getRange(2, 1, last - 1, t.n + 2).getValues();
+        let changed = false;
+        const sync = vals.map(function (r) {
+          const data = r.slice(0, t.n);
+          if (!String(data[t.keyIdx] || '').trim()) return [r[t.n], r[t.n + 1]];
+          let upd = Number(r[t.n]) || 0;
+          let h = String(r[t.n + 1] || '');
+          const nh = rowHash_(data);
+          if (nh !== h) { h = nh; upd = now; changed = true; }
+          if (upd > since) {
+            const o = rowToObj_(spec, t, data, ownerEmail);
+            o.updated = upd;
+            rows[k].push(o);
+          }
+          return [upd, h];
+        });
+        if (changed) t.sh.getRange(2, t.n + 1, sync.length, 2).setValues(sync);
+      });
+    });
+    return { now: now, settings: getSettings_(), rows: rows };
+  });
+}
+
+/** Writes rows changed on Cloudflare. The newer "Updated" wins if both sides changed a row. */
+function syncPush_(req) {
+  const ownerEmail = String(req.ownerEmail || '').toLowerCase();
+  return withLock_(function () {
+    const ss = getStore_().ss;
+    const tabs = {};
+    let applied = 0, skipped = 0;
+    Object.keys(SYNC_SPECS).forEach(function (k) {
+      const spec = SYNC_SPECS[k];
+      ((req.rows && req.rows[k]) || []).forEach(function (o) {
+        const keyVal = String(o[spec.key] || '').trim();
+        const lay = pickLayout_(spec, o, ownerEmail);
+        if (!keyVal || !lay) return;
+        let t = tabs[lay.name];
+        if (!t) { t = tabs[lay.name] = syncTab_(ss, spec, lay); t.index = keyIndex_(t); }
+        const vals = objToRow_(spec, t, o);
+        let row = t.index[keyVal];
+        if (row) {
+          const cur = t.sh.getRange(row, 1, 1, t.n + 2).getValues()[0];
+          if ((Number(cur[t.n]) || 0) > (Number(o.updated) || 0)) { skipped++; return; }
+          spec.sheetOwned.forEach(function (f) {
+            const i = (t.lay.userCol ? 1 : 0) + spec.fields.indexOf(f);
+            vals[i] = cur[i];
+          });
+          t.sh.getRange(row, 1, 1, t.n).setValues([vals]);
+        } else {
+          t.sh.appendRow(vals);
+          row = t.sh.getLastRow();
+          t.index[keyVal] = row;
+        }
+        const back = t.sh.getRange(row, 1, 1, t.n).getValues()[0];
+        t.sh.getRange(row, t.n + 1, 1, 2).setValues([[Number(o.updated) || Date.now(), rowHash_(back)]]);
+        applied++;
+      });
+    });
+    if (req.settings) saveSettings_(req.settings);
+    return { applied: applied, skipped: skipped };
+  });
+}
+
+function getTesterRoot_() {
+  const props = PropertiesService.getScriptProperties();
+  const id = props.getProperty('TESTER_FOLDER_ID');
+  if (id) { try { return DriveApp.getFolderById(id); } catch (err) { /* recreate below */ } }
+  const f = DriveApp.createFolder('Bark Monitor Tester Clips');
+  props.setProperty('TESTER_FOLDER_ID', f.getId());
+  return f;
+}
+
+function subFolder_(parent, name) {
+  const it = parent.getFoldersByName(name);
+  return it.hasNext() ? it.next() : parent.createFolder(name);
+}
+
+/** {user: '' for the owner or the tester's email, episodeId} for a Bark Monitor clip, else null. */
+function clipOwnerOf_(f, ownerId, testerRootId) {
+  const ps = f.getParents();
+  if (!ps.hasNext()) return null;
+  const ep = ps.next();
+  const gps = ep.getParents();
+  if (!gps.hasNext()) return null;
+  const gp = gps.next();
+  if (gp.getId() === ownerId) return { user: '', episodeId: ep.getName() };
+  const ggs = gp.getParents();
+  if (ggs.hasNext() && ggs.next().getId() === testerRootId) return { user: gp.getName(), episodeId: ep.getName() };
+  return null;
+}
+
+/** Clip files changed since `since` (ms). Clip names start with the episode id ("E2026…"). */
+function syncClipList_(since) {
+  const ownerId = getStore_().folder.getId();
+  const testerRootId = getTesterRoot_().getId();
+  const when = Utilities.formatDate(new Date(since), 'UTC', "yyyy-MM-dd'T'HH:mm:ss");
+  const it = DriveApp.searchFiles(
+    "title contains 'E20' and mimeType contains 'audio/' and trashed = false and modifiedDate > '" + when + "'");
+  const files = [];
+  while (it.hasNext() && files.length < 300) {
+    const f = it.next();
+    const c = clipOwnerOf_(f, ownerId, testerRootId);
+    if (!c) continue;
+    files.push({
+      id: f.getId(), name: f.getName(), episodeId: c.episodeId, user: c.user,
+      size: f.getSize(), mime: f.getMimeType(), created: f.getDateCreated().toISOString()
+    });
+  }
+  return { now: Date.now(), files: files, more: it.hasNext() };
+}
+
+function syncClipGet_(fileId) {
+  const f = DriveApp.getFileById(String(fileId));
+  if (!clipOwnerOf_(f, getStore_().folder.getId(), getTesterRoot_().getId())) throw new Error('Not a Bark Monitor clip');
+  return { name: f.getName(), mime: f.getMimeType(), data: Utilities.base64Encode(f.getBlob().getBytes()) };
+}
+
+/** Saves a clip recorded on Cloudflare into Drive and updates its episode row's clip link and count. */
+function syncClipUp_(req) {
+  if (!/^E[\w-]+$/.test(String(req.episodeId))) throw new Error('Bad episode id');
+  const name = String(req.name || 'clip.mp3').replace(/[^\w.-]/g, '_').slice(0, 80);
+  const type = /^audio\//.test(String(req.mime)) ? String(req.mime).split(';')[0] : 'audio/mpeg';
+  const store = getStore_();
+  let parent = store.folder;
+  if (!req.owner) {
+    const u = String(req.user || '').replace(/[^\w@.+-]/g, '_').slice(0, 120);
+    if (!u) throw new Error('Missing user');
+    parent = subFolder_(getTesterRoot_(), u);
+  }
+  const sub = subFolder_(parent, String(req.episodeId));
+  const existing = sub.getFilesByName(name);
+  const file = existing.hasNext() ? existing.next()
+    : sub.createFile(Utilities.newBlob(Utilities.base64Decode(String(req.data || '')), type, name));
+
+  let count = 0;
+  const all = sub.getFiles();
+  while (all.hasNext()) { if (/^audio\//.test(all.next().getMimeType())) count++; }
+
+  withLock_(function () {
+    const spec = SYNC_SPECS.episodes;
+    const lay = syncLayouts_(spec).filter(function (l) { return l.kind === (req.owner ? 'owner' : 'tester'); })[0];
+    const t = syncTab_(store.ss, spec, lay);
+    const row = keyIndex_(t)[String(req.episodeId)];
+    if (row) {
+      const off = t.lay.userCol ? 1 : 0;
+      t.sh.getRange(row, off + spec.fields.indexOf('clipsUrl') + 1, 1, 2).setValues([[sub.getUrl(), count]]);
+    }
+  });
+  return { fileId: file.getId() };
+}

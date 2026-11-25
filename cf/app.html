@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bark Meter · Demo</title>
+<style>
+  :root{--bg:#0d1117;--panel:#161b22;--line:#2a313c;--text:#e6edf3;--muted:#8b949e;--accent:#3fb950;--warn:#d29922;--bad:#f85149;--blue:#58a6ff}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding:16px;max-width:620px;margin-inline:auto}
+  h1{font-size:22px;margin:4px 0 2px} h2{font-size:17px;margin:0 0 10px}
+  .sub{color:var(--muted);font-size:13px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px;margin:12px 0}
+  label{display:block;font-size:13px;color:var(--muted);margin:10px 0 4px}
+  input,select,textarea{width:100%;font:inherit;background:#0b0f14;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px}
+  textarea{min-height:90px;resize:vertical}
+  button{font:inherit;font-weight:600;border:0;border-radius:10px;padding:11px 16px;cursor:pointer}
+  .go{background:var(--accent);color:#04160a} .ghost{background:transparent;border:1px solid var(--line);color:var(--text)}
+  .big{display:block;width:100%;text-align:center;font-size:17px;padding:14px;text-decoration:none;border-radius:10px}
+  .row{display:flex;gap:8px;align-items:center;justify-content:space-between;flex-wrap:wrap}
+  .tabs{display:flex;gap:6px;margin:14px 0 0;flex-wrap:wrap}
+  .tabs button{background:transparent;border:1px solid var(--line);color:var(--muted);padding:8px 12px}
+  .tabs button.on{background:var(--panel);color:var(--text);border-color:var(--blue)}
+  .msg{color:var(--warn);font-size:13px;min-height:18px;margin-top:8px}
+  .ok{color:var(--accent)}
+  ul{list-style:none;margin:0;padding:0} li{border-top:1px solid var(--line);padding:10px 0}
+  .pill{font-size:11px;padding:1px 7px;border-radius:9px;background:var(--line);color:var(--text);margin-left:6px}
+  .pill.sus{background:var(--bad);color:#fff} .pill.new{background:var(--warn);color:#000}
+  audio{width:100%;margin-top:6px;height:36px}
+  .muted{color:var(--muted)} a{color:var(--blue)}
+  .reply{border-left:3px solid var(--blue);padding-left:8px;margin-top:6px;font-size:14px}
+  table{width:100%;border-collapse:collapse;font-size:14px} td{padding:6px 4px;border-top:1px solid var(--line);vertical-align:top}
+  .hidden{display:none}
+</style>
+</head>
+<body>
+<h1>Bark Meter</h1>
+<div class="sub">Demo · testers' version</div>
+
+<!-- signed out -->
+<div id="authView" class="hidden">
+  <div class="tabs"><button id="tLogin" class="on">Sign in</button><button id="tSignup">Create account</button></div>
+  <div class="card">
+    <div id="signupOnly" class="hidden">
+      <label>Your name</label><input id="aName" autocomplete="name">
+      <label>Invite code</label><input id="aInvite" autocomplete="off">
+    </div>
+    <label>Email</label><input id="aEmail" type="email" autocomplete="email">
+    <label>Password <span id="pwHint" class="hidden">(at least 8 characters)</span></label>
+    <input id="aPass" type="password" autocomplete="current-password">
+    <div style="margin-top:14px"><button class="go" id="aBtn">Sign in</button></div>
+    <div class="msg" id="aMsg"></div>
+  </div>
+</div>
+
+<!-- signed in -->
+<div id="appView" class="hidden">
+  <div class="row" style="margin-top:8px">
+    <span id="who" class="sub"></span>
+    <button class="ghost" id="logoutBtn" style="padding:6px 10px">Sign out</button>
+  </div>
+  <div class="card">
+    <a class="big go" id="listenLink" href="/listener">Open the Listener</a>
+    <p class="sub" style="margin:10px 0 0">Use this on the phone you leave by the window. Allow the microphone, then tap Start monitoring.</p>
+  </div>
+  <div class="tabs" id="tabs">
+    <button data-p="log" class="on">My log</button>
+    <button data-p="fb">Feedback</button>
+    <button data-p="admin" id="adminTab" class="hidden">Admin</button>
+  </div>
+
+  <div id="p-log" class="card">
+    <div class="row"><h2>Barking episodes</h2><span class="sub" id="logCount"></span></div>
+    <div class="row hidden" id="viewAs" style="margin-bottom:8px"><span class="sub">Showing:</span><select id="viewUser" style="width:auto;flex:1"></select></div>
+    <ul id="epList"></ul>
+  </div>
+
+  <div id="p-fb" class="card hidden">
+    <h2>Send feedback</h2>
+    <p class="sub" style="margin-top:0">Report anything that went wrong, or ideas for new features.</p>
+    <label>Type</label>
+    <select id="fKind"><option>Bug</option><option>Feature idea</option><option>Question</option><option>Other</option></select>
+    <label>Message</label><textarea id="fMsg" placeholder="What happened, or what would you like?"></textarea>
+    <div style="margin-top:12px"><button class="go" id="fBtn">Send</button></div>
+    <div class="msg" id="fStatus"></div>
+    <h2 style="margin-top:18px" id="fbListTitle">Your feedback</h2>
+    <ul id="fbList"></ul>
+  </div>
+
+  <div id="p-admin" class="card hidden">
+    <h2>Owner tools</h2>
+    <div id="secretWarn" class="msg"></div>
+    <label>Invite code for testers</label>
+    <div class="row" style="flex-wrap:nowrap"><input id="invCode" placeholder="e.g. barkdemo2026"><button class="ghost" id="invBtn">Save</button></div>
+    <div class="sub" style="margin-top:4px">Testers need this code to create an account.</div>
+
+    <h2 style="margin-top:18px">Sync with Google Sheets</h2>
+    <div id="syncInfo" class="sub"></div>
+    <div style="margin-top:8px"><button class="ghost" id="syncBtn">Sync now</button></div>
+
+    <h2 style="margin-top:18px">Testers</h2>
+    <table><tbody id="userRows"></tbody></table>
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+  const $ = (id) => document.getElementById(id);
+  let me = null, mode = 'login';
+
+  function el(tag, attrs, ...kids) {
+    const e = document.createElement(tag);
+    Object.entries(attrs || {}).forEach(([k, v]) => {
+      if (k === 'class') e.className = v; else if (k.startsWith('on')) e[k] = v; else e.setAttribute(k, v);
+    });
+    kids.flat().forEach((c) => { if (c !== null && c !== undefined && c !== false) e.append(c instanceof Node ? c : String(c)); });
+    return e;
+  }
+  async function api(path, body) {
+    const res = await fetch(path, body === undefined ? {} : {
+      method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify(body)
+    });
+    let j;
+    try { j = await res.json(); } catch (e) { throw new Error('Server problem (HTTP ' + res.status + ')'); }
+    if (!j.ok) throw new Error(j.error || 'Request failed');
+    return j.result;
+  }
+  // The password is stretched here (PBKDF2), so the server never sees it.
+  async function derive(email, pw) {
+    const k = await crypto.subtle.importKey('raw', new TextEncoder().encode(pw), 'PBKDF2', false, ['deriveBits']);
+    const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', iterations: 310000,
+      salt: new TextEncoder().encode('barkmeter:' + email) }, k, 256);
+    return [...new Uint8Array(bits)].map((b) => b.toString(16).padStart(2, '0')).join('');
+  }
+  const fmtDT = (s) => { const d = new Date(s); return isNaN(d) ? '' : d.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }); };
+  const fmtT = (s) => { const d = new Date(s); return isNaN(d) ? '' : d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); };
+
+  /* ---------------- sign in / create account */
+  function setMode(m) {
+    mode = m;
+    $('tLogin').className = m === 'login' ? 'on' : '';
+    $('tSignup').className = m === 'signup' ? 'on' : '';
+    $('signupOnly').classList.toggle('hidden', m !== 'signup');
+    $('pwHint').classList.toggle('hidden', m !== 'signup');
+    $('aPass').autocomplete = m === 'signup' ? 'new-password' : 'current-password';
+    $('aBtn').textContent = m === 'signup' ? 'Create account' : 'Sign in';
+    $('aMsg').textContent = '';
+  }
+  $('tLogin').onclick = () => setMode('login');
+  $('tSignup').onclick = () => setMode('signup');
+  $('aBtn').onclick = async () => {
+    const email = $('aEmail').value.trim().toLowerCase(), pw = $('aPass').value;
+    if (!email || !pw) { $('aMsg').textContent = 'Enter your email and password.'; return; }
+    if (mode === 'signup' && pw.length < 8) { $('aMsg').textContent = 'Use at least 8 characters for the password.'; return; }
+    $('aBtn').disabled = true; $('aMsg').textContent = 'One moment…';
+    try {
+      const pass = await derive(email, pw);
+      me = mode === 'signup'
+        ? await api('/api/signup', { email, pass, name: $('aName').value.trim(), invite: $('aInvite').value.trim() })
+        : await api('/api/login', { email, pass });
+      $('aPass').value = '';
+      showApp();
+    } catch (e) { $('aMsg').textContent = e.message; }
+    $('aBtn').disabled = false;
+  };
+  $('aPass').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('aBtn').click(); });
+  $('logoutBtn').onclick = async () => { try { await api('/api/logout', {}); } catch (e) {} me = null; showAuth(); };
+
+  /* ---------------- app */
+  function showAuth() { $('appView').classList.add('hidden'); $('authView').classList.remove('hidden'); }
+  function showApp() {
+    $('authView').classList.add('hidden'); $('appView').classList.remove('hidden');
+    $('who').textContent = 'Signed in as ' + (me.name || me.email) + (me.role === 'owner' ? ' (owner)' : '');
+    $('listenLink').href = '/listener#api=' + encodeURIComponent(location.origin + '/api/rpc') + '&key=session';
+    $('adminTab').classList.toggle('hidden', me.role !== 'owner');
+    $('fbListTitle').textContent = me.role === 'owner' ? 'All feedback' : 'Your feedback';
+    show('log');
+  }
+  document.querySelectorAll('#tabs button').forEach((b) => { b.onclick = () => show(b.dataset.p); });
+  function show(p) {
+    document.querySelectorAll('#tabs button').forEach((b) => b.classList.toggle('on', b.dataset.p === p));
+    ['log', 'fb', 'admin'].forEach((x) => $('p-' + x).classList.toggle('hidden', x !== p));
+    if (p === 'log') loadLog(); else if (p === 'fb') loadFb(); else loadAdmin();
+  }
+
+  /* ---------------- my log */
+  async function loadLog() {
+    const list = $('epList');
+    list.replaceChildren(el('li', { class: 'muted' }, 'Loading…'));
+    try {
+      const who = me.role === 'owner' && $('viewUser').value ? $('viewUser').value : '';
+      const d = await api('/api/episodes' + (who ? '?user=' + encodeURIComponent(who) : ''));
+      const clips = {};
+      d.clips.forEach((c) => { (clips[c.episode_id] = clips[c.episode_id] || []).push(c); });
+      $('logCount').textContent = d.episodes.length ? d.episodes.length + ' shown' : '';
+      if (!d.episodes.length) { list.replaceChildren(el('li', { class: 'muted' }, 'No barking logged yet. Open the Listener to start.')); return; }
+      list.replaceChildren(...d.episodes.map((e) => {
+        const dur = e.durationMin < 1 ? Math.round(e.durationMin * 60) + ' s' : e.durationMin.toFixed(1) + ' min';
+        return el('li', {},
+          el('div', { class: 'row' },
+            el('span', {}, fmtDT(e.start) + ' – ' + fmtT(e.end)),
+            el('span', {}, dur, el('span', { class: 'pill' + (e.sustained ? ' sus' : '') }, e.sustained ? 'sustained' : 'short'))),
+          e.notes ? el('div', { class: 'sub' }, e.notes) : null,
+          (clips[e.id] || []).map((c) => el('audio', { controls: '', preload: 'none', src: '/api/clip?key=' + encodeURIComponent(c.key) })));
+      }));
+    } catch (e) { list.replaceChildren(el('li', { class: 'msg' }, e.message)); }
+  }
+  $('viewUser').onchange = loadLog;
+
+  /* ---------------- feedback */
+  $('fBtn').onclick = async () => {
+    const message = $('fMsg').value.trim();
+    if (!message) { $('fStatus').textContent = 'Write a message first.'; return; }
+    $('fBtn').disabled = true;
+    try {
+      await api('/api/feedback', { kind: $('fKind').value, message, page: 'app' });
+      $('fMsg').value = ''; $('fStatus').textContent = 'Thanks! Sent.'; $('fStatus').className = 'msg ok';
+      loadFb();
+    } catch (e) { $('fStatus').textContent = e.message; $('fStatus').className = 'msg'; }
+    $('fBtn').disabled = false;
+  };
+  async function loadFb() {
+    const list = $('fbList');
+    try {
+      const items = await api('/api/feedback');
+      if (!items.length) { list.replaceChildren(el('li', { class: 'muted' }, 'Nothing yet.')); return; }
+      list.replaceChildren(...items.map((f) => {
+        const li = el('li', {},
+          el('div', { class: 'row' },
+            el('b', {}, f.kind, el('span', { class: 'pill' + (f.status === 'New' ? ' new' : '') }, f.status || 'New')),
+            el('span', { class: 'sub' }, fmtDT(f.created))),
+          me.role === 'owner' ? el('div', { class: 'sub' }, f.user) : null,
+          el('div', { style: 'white-space:pre-wrap;margin-top:4px' }, f.message),
+          f.reply ? el('div', { class: 'reply' }, 'Reply: ', f.reply) : null);
+        if (me.role === 'owner') {
+          const st = el('select', { style: 'width:auto' }, ['New', 'Seen', 'Planned', 'Fixed', "Won't fix"].map((s) => {
+            const o = el('option', {}, s); if (s === f.status) o.selected = true; return o;
+          }));
+          const rp = el('input', { placeholder: 'Reply to the tester (optional)' }); rp.value = f.reply || '';
+          const sv = el('button', { class: 'ghost', style: 'padding:8px 12px' }, 'Save');
+          sv.onclick = async () => {
+            sv.disabled = true;
+            try { await api('/api/admin/feedback', { id: f.id, status: st.value, reply: rp.value }); loadFb(); }
+            catch (e) { alert(e.message); sv.disabled = false; }
+          };
+          li.append(el('div', { class: 'row', style: 'margin-top:8px;flex-wrap:nowrap' }, st, rp, sv));
+        }
+        return li;
+      }));
+    } catch (e) { list.replaceChildren(el('li', { class: 'msg' }, e.message)); }
+  }
+
+  /* ---------------- admin */
+  async function loadAdmin() {
+    try {
+      const d = await api('/api/admin');
+      $('invCode').value = d.inviteCode || '';
+      const miss = [];
+      if (!d.secrets.url) miss.push('APPS_SCRIPT_URL');
+      if (!d.secrets.key) miss.push('APPS_SCRIPT_KEY');
+      $('secretWarn').textContent = miss.length ? 'Sync is off until you add these secrets in Cloudflare: ' + miss.join(', ') : '';
+      const s = d.sync || {};
+      $('syncInfo').replaceChildren(
+        el('div', {}, s.at ? 'Last sync: ' + fmtDT(s.at) + (s.ok ? ' ✓' : ' — problem') : 'Not synced yet (runs every 5 minutes).'),
+        s.error ? el('div', { class: 'msg' }, s.error) : null,
+        s.clipError ? el('div', { class: 'msg' }, 'Clip: ' + s.clipError) : null,
+        el('div', {}, d.counts.episodes + ' episodes · ' + d.counts.clips + ' clips on Cloudflare'),
+        el('div', {}, 'Waiting to go to Google: ' + d.counts.rows_waiting + ' rows, ' + d.counts.clips_waiting + ' clips'));
+      $('userRows').replaceChildren(...d.users.map((u) => {
+        const t = el('button', { class: 'ghost', style: 'padding:6px 10px' }, u.active ? 'Turn off' : 'Turn on');
+        t.onclick = async () => { await api('/api/admin/user', { email: u.email, active: !u.active }); loadAdmin(); };
+        return el('tr', {},
+          el('td', {}, el('div', {}, u.name || ''), el('div', { class: 'sub' }, u.email)),
+          el('td', { class: 'sub' }, u.role === 'owner' ? 'Owner' : (u.active ? 'Active' : 'Off'), el('br'), u.last_login ? 'Last in ' + fmtDT(u.last_login) : ''),
+          el('td', { style: 'text-align:right' }, u.role === 'owner' ? '' : t));
+      }));
+      const sel = $('viewUser'), cur = sel.value;
+      sel.replaceChildren(el('option', { value: '' }, 'My own log'), ...d.users.filter((u) => u.role !== 'owner').map((u) => el('option', { value: u.email }, u.name + ' (' + u.email + ')')));
+      sel.value = cur;
+      $('viewAs').classList.toggle('hidden', d.users.length < 2);
+    } catch (e) { $('secretWarn').textContent = e.message; }
+  }
+  $('invBtn').onclick = async () => {
+    try { await api('/api/admin/invite', { code: $('invCode').value }); $('secretWarn').textContent = ''; alert('Invite code saved.'); }
+    catch (e) { alert(e.message); }
+  };
+  $('syncBtn').onclick = async () => {
+    $('syncBtn').disabled = true; $('syncBtn').textContent = 'Syncing…';
+    try { await api('/api/admin/sync', {}); } catch (e) { alert(e.message); }
+    $('syncBtn').disabled = false; $('syncBtn').textContent = 'Sync now';
+    loadAdmin();
+  };
+
+  /* ---------------- start */
+  api('/api/me').then((u) => { me = u; showApp(); if (u.role === 'owner') loadAdmin(); })
+    .catch(() => { setMode('login'); showAuth(); });
+})();
+</script>
+</body>
+</html>
