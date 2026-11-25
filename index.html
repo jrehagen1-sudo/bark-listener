@@ -272,6 +272,10 @@
   const STOP_QUIET_SEC = 30;   // seconds of quiet that stop a recording
   const FILE_MINUTES = 5;      // length of each recording file while barking continues
   const HEARTBEAT_MS = 5 * 60 * 1000;
+  const CHECKIN_MS = 60 * 1000;        // status report + remote command check (dashboard "Restart listener")
+  const WATCHDOG_MS = 15 * 1000;
+  const STALE_AUDIO_MS = 90 * 1000;    // no sound data this long while listening = audio has stalled
+  const VERSION = '2026-11-25 remote restart';
 
   const $ = (id) => document.getElementById(id);
   const store = {
@@ -311,7 +315,8 @@
     heartbeat: (id) => api('heartbeat', { sessionId: id }),
     stopSession: (id) => api('stop', { sessionId: id }),
     logEpisode: (ep) => api('episode', { episode: ep }),
-    saveClip: (id, name, data, mime) => api('clip', { episodeId: id, fileName: name, data: data, mimeType: mime })
+    saveClip: (id, name, data, mime) => api('clip', { episodeId: id, fileName: name, data: data, mimeType: mime }),
+    checkin: (status, done) => api('checkin', { status: status, done: done })
   };
   const run = (fn, ...args) => ACTIONS[fn](...args);
 
@@ -340,6 +345,9 @@
   let settings = null, classifier = null, stream = null, ctx = null, proc = null, source = null;
   let engine = null, keeper = null, gate = null, sessionId = null, running = false;
   let mp3 = null, beatTimer = null, wakeLock = null;
+  let starting = false, needsTap = false, micEnded = false, lastAudioAt = 0, lastError = '', lastRestart = null;
+  let allowUnload = false;
+  const PAGE_LOADED = Date.now();
   let currentEpisodeId = null;
   const today = { key: dayKey(Date.now()), ep: 0, sus: 0, min: 0 };
   const recent = [];
@@ -543,6 +551,7 @@
   }
 
   function onAudio(ev) {
+    lastAudioAt = Date.now();
     const data = ev.inputBuffer.getChannelData(0);
     const t = Date.now() - Math.round(data.length / ctx.sampleRate * 1000);
     let sum = 0;
@@ -572,8 +581,12 @@
 
   /* ------------------------------------------------------- start / stop */
   let startedAt = 0;
-  async function start() {
+  /** opts.auto = started by the page itself (after a reload or a restart), not by a tap. */
+  async function start(opts) {
+    if (running || starting) return;
+    starting = true;
     $('startBtn').disabled = true;
+    micEnded = false;
     // Create the audio context inside the tap so Chrome lets it run.
     ctx = new AudioContext({ sampleRate: 16000 });
     try {
@@ -584,8 +597,11 @@
       stream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
       });
+      stream.getAudioTracks().forEach(t => t.addEventListener('ended', () => { micEnded = true; log('Microphone stopped'); }));
+      await resumeAudio(opts && opts.auto);
       const res = await run('startSession', store.get('device', 'Android listener'));
       sessionId = res.sessionId; settings = res.settings; fillSettings(settings);
+      store.set('sessionId', sessionId);
 
       engine = new BarkEngine({
         threshold: settings.threshold, gapSeconds: settings.gapSeconds,
@@ -594,7 +610,6 @@
       keeper = new ClipKeeper();
       gate = new RecGate(START_BARK_SEC, STOP_QUIET_SEC);
 
-      if (ctx.state === 'suspended') await ctx.resume();
       source = ctx.createMediaStreamSource(stream);
       proc = ctx.createScriptProcessor(16384, 1, 1);
       engine.configure({ frameSec: 16384 / ctx.sampleRate });
@@ -602,13 +617,15 @@
       source.connect(proc);
       proc.connect(ctx.destination);
 
-      running = true; startedAt = Date.now();
+      running = true; startedAt = Date.now(); lastAudioAt = Date.now(); lastError = '';
+      store.set('want', true);
       beatTimer = setInterval(() => { run('heartbeat', sessionId).catch(() => {}); flush(); }, HEARTBEAT_MS);
       await keepAwake();
       $('stopBtn').disabled = false;
       setStatus('Listening', 'Since ' + fmtTime(startedAt), 'on');
-      log('Monitoring started (session ' + sessionId + ')');
+      log('Monitoring started (session ' + sessionId + ')' + (opts && opts.auto ? ' automatically' : ''));
     } catch (e) {
+      lastError = String(e && e.message || e).slice(0, 150);
       log('Start failed: ' + (e.message || e));
       const denied = e && (e.name === 'NotAllowedError' || /permission/i.test(e.message || ''));
       setStatus('Could not start', denied
@@ -616,15 +633,46 @@
         : String(e.message || e), '');
       await teardown();
       $('startBtn').disabled = false;
+    } finally {
+      starting = false; needsTap = false;
     }
   }
 
-  async function stop() {
+  /**
+   * Chrome only lets audio run after someone has tapped the page. A restart inside the same page
+   * keeps that tap; a reload usually does too. If Chrome still holds the audio back (for example
+   * after Chrome or the phone restarted), wait for a tap and tell the dashboard.
+   */
+  async function resumeAudio(auto) {
+    if (ctx.state === 'running') return;
+    try { await Promise.race([ctx.resume(), sleep(3000)]); } catch (e) {}
+    if (ctx.state === 'running' || !auto) return;
+    needsTap = true;
+    $('startBtn').disabled = false;
+    setStatus('Tap to resume', 'Chrome needs one tap on this screen before it lets the microphone run again.', 'bark');
+    log('Waiting for a tap: Chrome would not start audio on its own');
+    checkin();
+    await new Promise(resolve => {
+      const go = () => {
+        ctx.resume().then(() => {
+          if (ctx.state === 'running') { document.removeEventListener('click', go, true); resolve(); }
+        }).catch(() => {});
+      };
+      document.addEventListener('click', go, true);
+    });
+    needsTap = false;
+    $('startBtn').disabled = true;
+    log('Tapped, starting');
+  }
+
+  /** opts.byUser = the Stop button: the page stays stopped, even after a reload. */
+  async function stop(opts) {
     $('stopBtn').disabled = true;
     running = false;
+    if (opts && opts.byUser) store.set('want', false);
     if (engine && engine.active) engine.finish();   // logs the open episode
     await teardown();
-    if (sessionId) { run('stopSession', sessionId).catch(() => {}); sessionId = null; }
+    if (sessionId) { run('stopSession', sessionId).catch(() => {}); sessionId = null; store.set('sessionId', null); }
     setStatus('Not listening', 'Stopped at ' + fmtTime(Date.now()), '');
     $('startBtn').disabled = false;
     log('Monitoring stopped');
@@ -655,11 +703,144 @@
       if (!wakeLock) keepAwake();
     }
   });
-  window.addEventListener('beforeunload', (e) => { if (running) { e.preventDefault(); e.returnValue = ''; } });
+  window.addEventListener('beforeunload', (e) => { if (running && !allowUnload) { e.preventDefault(); e.returnValue = ''; } });
 
-  $('startBtn').onclick = start;
-  $('stopBtn').onclick = stop;
+  /* ------------------------------------------------------- restart / watchdog / remote */
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  let restarting = false;
+  function recentRestarts() {
+    const cut = Date.now() - 15 * 60000;
+    const list = store.get('restartTimes', []).filter(t => t > cut);
+    store.set('restartTimes', list);
+    return list;
+  }
+
+  /** Stops and starts the listener inside this page. After 3 restarts in 15 minutes it reloads the page instead. */
+  async function restart(reason) {
+    if (restarting || starting) return needsTap ? 'needs a tap on the phone' : 'already restarting';
+    restarting = true;
+    try {
+      lastRestart = { at: Date.now(), reason: reason };
+      const list = recentRestarts();
+      if (list.length >= 3) return reloadPage(reason + ' (3 restarts in 15 min)');
+      list.push(Date.now()); store.set('restartTimes', list);
+      log('Restarting: ' + reason);
+      if (running) await stop();
+      const p = start({ auto: true });
+      await Promise.race([p, sleep(20000)]);
+      return running ? 'restarted, listening' : needsTap ? 'needs a tap on the phone' : 'could not start: ' + (lastError || 'unknown');
+    } finally { restarting = false; }
+  }
+
+  /** Full page reload, at most once every 30 minutes. The page starts listening again on load. */
+  function reloadPage(reason) {
+    const last = store.get('lastReload', 0);
+    if (Date.now() - last < 30 * 60000) { log('Not reloading again so soon (' + reason + ')'); return 'stuck, page reloaded less than 30 min ago'; }
+    store.set('lastReload', Date.now());
+    store.set('reloadReason', reason);
+    log('Reloading page: ' + reason);
+    allowUnload = true;
+    setTimeout(() => location.reload(), 500);
+    return 'reloading the page';
+  }
+
+  // Watchdog: restarts the listener when the sound stops arriving or the microphone drops.
+  setInterval(() => {
+    if (!running || restarting || starting) return;
+    if (ctx && ctx.state === 'suspended') ctx.resume().catch(() => {});
+    const age = Date.now() - lastAudioAt;
+    let why = '';
+    if (micEnded) why = 'microphone stopped';
+    else if (!ctx || ctx.state === 'closed') why = 'audio closed';
+    else if (age > STALE_AUDIO_MS) why = 'no sound data for ' + Math.round(age / 1000) + ' s';
+    if (why) restart('watchdog: ' + why).then(r => log('Watchdog restart: ' + r));
+  }, WATCHDOG_MS);
+
+  let micPerm = '';
+  try {
+    navigator.permissions.query({ name: 'microphone' }).then(p => {
+      micPerm = p.state; p.onchange = () => { micPerm = p.state; };
+    }).catch(() => {});
+  } catch (e) {}
+
+  async function statusReport() {
+    const st = {
+      v: VERSION,
+      state: needsTap ? 'needs-tap' : running ? (engine && engine.active ? 'barking' : 'listening') : starting ? 'starting' : 'stopped',
+      audio: ctx ? ctx.state : 'off',
+      audioAgeSec: running ? Math.round((Date.now() - lastAudioAt) / 1000) : null,
+      listeningSince: running ? startedAt : null,
+      pageSince: PAGE_LOADED,
+      prevAliveAt: prevAlive || null,
+      reloadReason: reloadNote || '',
+      visible: document.visibilityState === 'visible',
+      wakeLock: !!wakeLock,
+      mic: micPerm,
+      session: sessionId || '',
+      restarts15m: recentRestarts().length,
+      lastRestart: lastRestart ? new Date(lastRestart.at).toISOString() + ' ' + lastRestart.reason : '',
+      lastError: lastError,
+      queued: pending.length + clipsWaiting
+    };
+    try {
+      if (navigator.getBattery) { const b = await navigator.getBattery(); st.battery = Math.round(b.level * 100); st.charging = b.charging; }
+    } catch (e) {}
+    return st;
+  }
+
+  // Check-in: tells the dashboard how the phone is doing and picks up a "Restart listener" command.
+  const prevAlive = store.get('aliveAt', 0);
+  const reloadNote = store.get('reloadReason', '');
+  store.set('reloadReason', '');
+  let checkinFails = 0, checkingIn = false;
+  async function checkin() {
+    if (checkingIn || !conn().api) return;
+    checkingIn = true;
+    try {
+      const done = store.get('cmdDone', null);
+      const r = await run('checkin', await statusReport(), done);
+      store.set('aliveAt', Date.now());
+      checkinFails = 0;
+      if (done) store.set('cmdDone', null);
+      const c = r && r.command;
+      if (c && c.id !== store.get('lastCmd', '')) {
+        store.set('lastCmd', c.id);
+        log('Restart requested from the dashboard');
+        store.set('cmdDone', { id: c.id, result: 'started' });   // kept if the page reloads mid-way
+        let result = 'unknown command';
+        if (c.cmd === 'restart') result = running || needsTap ? await restart('dashboard') : (await restartFromStopped());
+        store.set('cmdDone', { id: c.id, result: result });
+        checkingIn = false;
+        setTimeout(checkin, 2000);
+      }
+    } catch (e) {
+      if (++checkinFails === 1) log('Check-in failed: ' + (e.message || e));
+    } finally { checkingIn = false; }
+  }
+  async function restartFromStopped() {
+    if (starting) return needsTap ? 'needs a tap on the phone' : 'already starting';
+    const p = start({ auto: true });
+    await Promise.race([p, sleep(20000)]);
+    return running ? 'started, listening' : needsTap ? 'needs a tap on the phone' : 'could not start: ' + (lastError || 'unknown');
+  }
+  setInterval(checkin, CHECKIN_MS);
+
+  $('startBtn').onclick = () => { if (!needsTap) start(); };
+  $('stopBtn').onclick = () => stop({ byUser: true });
   flush();
+
+  // After a reload (by the watchdog, the dashboard, or Chrome itself) pick up where it left off.
+  (function resume() {
+    const old = store.get('sessionId', null);
+    if (old && conn().api) { run('stopSession', old).catch(() => {}); store.set('sessionId', null); }
+    if (prevAlive) log('Page loaded. Last check-in from this phone: ' + new Date(prevAlive).toLocaleString());
+    if (reloadNote) log('Reloaded because: ' + reloadNote);
+    if (store.get('want', false) && conn().api && MP) {
+      log('Was listening before, starting again');
+      setTimeout(() => start({ auto: true }), 1500);
+    }
+    setTimeout(checkin, 4000);
+  })();
 })();
 </script>
 </body>

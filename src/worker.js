@@ -335,6 +335,7 @@ async function rpc(env, me, req) {
       case 'stop': out = await touchSession(env, me, req.sessionId, true); break;
       case 'episode': out = await logEpisode(env, me, req.episode); break;
       case 'clip': out = await saveClip(env, me, req.episodeId, req.fileName, req.data, req.mimeType); break;
+      case 'checkin': out = { command: null }; break;   // remote restart lives on the Apps Script dashboard only
       case 'ping': out = 'pong'; break;
       default: throw new Error('Unknown action: ' + req.action);
     }

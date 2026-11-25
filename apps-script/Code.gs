@@ -113,6 +113,7 @@ function doPost(e) {
       case 'stop':      out = stopSession_(req.sessionId); break;
       case 'episode':   out = logEpisode_(req.episode); break;
       case 'clip':      out = saveClip_(req.episodeId, req.fileName, req.data, req.mimeType); break;
+      case 'checkin':   out = listenerCheckin_(req.status, req.done); break;
       case 'ping':      out = 'pong'; break;
       // Two-way sync with the Cloudflare demo (called by the Cloudflare Worker every 5 minutes).
       case 'syncPull':     out = syncPull_(Number(req.since) || 0, String(req.ownerEmail || '')); break;
@@ -141,6 +142,8 @@ function getClipData(key, fileId) { checkKey_(key); return getClipData_(fileId);
 function saveMp3Copy(key, fileId, base64) { checkKey_(key); return saveMp3Copy_(fileId, base64); }
 function listAudioClips(key) { checkKey_(key); return listAudioClips_(); }
 function trashClips(key, ids) { checkKey_(key); return trashClips_(ids); }
+function sendListenerCommand(key, cmd) { checkKey_(key); return sendListenerCommand_(cmd); }
+function getListenerState(key) { checkKey_(key); return getListenerState_(); }
 
 /* ------------------------------------------------------------------ storage */
 
@@ -213,6 +216,7 @@ function startSession_(device) {
     const id = 'S' + Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyyMMdd-HHmmss') +
       '-' + Math.random().toString(36).slice(2, 5);
     const now = new Date();
+    closeLostSessions_(sh, now);
     sh.appendRow([id, String(device || 'Listener').slice(0, 60), now, now, '', 'Running']);
     return { sessionId: id, settings: getSettings_() };
   });
@@ -239,6 +243,21 @@ function stopSession_(sessionId) {
   });
 }
 
+/** Sessions still marked Running with no heartbeat for 15+ minutes stopped without saying so. */
+function closeLostSessions_(sh, now) {
+  const last = sh.getLastRow();
+  if (last < 2) return;
+  const n = Math.min(50, last - 1);
+  const first = last - n + 1;
+  const rows = sh.getRange(first, 1, n, SESSION_HEADERS.length).getValues();
+  rows.forEach(function (r, i) {
+    const beat = r[3] instanceof Date ? r[3] : new Date(r[3]);
+    if (String(r[5]) === 'Running' && !isNaN(beat) && now - beat > 15 * 60000) {
+      sh.getRange(first + i, 5, 1, 2).setValues([[beat, 'Lost (no heartbeat)']]);
+    }
+  });
+}
+
 function findRow_(sh, id) {
   const last = sh.getLastRow();
   if (last < 2 || !id) return 0;
@@ -247,6 +266,70 @@ function findRow_(sh, id) {
     if (String(ids[i][0]) === String(id)) return i + 2;
   }
   return 0;
+}
+
+/* ----------------------------------------------------- remote control */
+/*
+ * The Listener checks in about once a minute (action 'checkin') with a short status report.
+ * The dashboard can leave one command for it ('restart'); the Listener picks it up on its next
+ * check-in, carries it out and reports back with `done`. Kept in Script Properties, no sheet writes.
+ */
+const LISTENER_COMMANDS = { restart: true };
+const COMMAND_TTL_MS = 2 * 60 * 60 * 1000;   // a command not picked up within 2 hours is dropped
+
+function readJsonProp_(name) {
+  const raw = PropertiesService.getScriptProperties().getProperty(name);
+  try { return raw ? JSON.parse(raw) : null; } catch (e) { return null; }
+}
+function writeJsonProp_(name, v) {
+  PropertiesService.getScriptProperties().setProperty(name, JSON.stringify(v));
+}
+
+/** status = small object from the Listener; done = {id, result} for a finished command. */
+function listenerCheckin_(status, done) {
+  return withLock_(function () {
+    const now = Date.now();
+    const st = {};
+    if (status && typeof status === 'object') {
+      Object.keys(status).slice(0, 30).forEach(function (k) {
+        const v = status[k];
+        if (v === null || typeof v === 'number' || typeof v === 'boolean') st[k] = v;
+        else st[k] = String(v).slice(0, 200);
+      });
+    }
+    st.receivedAt = now;
+    writeJsonProp_('LISTENER_STATUS', st);
+
+    let cmd = readJsonProp_('LISTENER_CMD');
+    if (cmd && done && done.id === cmd.id && !cmd.doneAt) {
+      cmd.doneAt = now;
+      cmd.result = String(done.result || 'done').slice(0, 200);
+      writeJsonProp_('LISTENER_CMD', cmd);
+    }
+    if (cmd && !cmd.doneAt && !cmd.pickedAt && now - cmd.at > COMMAND_TTL_MS) {
+      cmd.doneAt = now; cmd.result = 'expired (phone did not check in)';
+      writeJsonProp_('LISTENER_CMD', cmd);
+    }
+    if (cmd && !cmd.doneAt) {
+      if (!cmd.pickedAt) { cmd.pickedAt = now; writeJsonProp_('LISTENER_CMD', cmd); }
+      return { command: { id: cmd.id, cmd: cmd.cmd } };
+    }
+    return { command: null };
+  });
+}
+
+function sendListenerCommand_(cmd) {
+  if (!LISTENER_COMMANDS[cmd]) throw new Error('Unknown command: ' + cmd);
+  return withLock_(function () {
+    const c = { id: 'C' + Date.now().toString(36), cmd: cmd, at: Date.now() };
+    writeJsonProp_('LISTENER_CMD', c);
+    return getListenerStateNoLock_();
+  });
+}
+
+function getListenerState_() { return getListenerStateNoLock_(); }
+function getListenerStateNoLock_() {
+  return { status: readJsonProp_('LISTENER_STATUS'), command: readJsonProp_('LISTENER_CMD'), now: Date.now() };
 }
 
 /* ----------------------------------------------------------------- episodes */
@@ -356,6 +439,7 @@ function getDashboardData_() {
   return {
     episodes: episodes, sessions: sessions, settings: getSettings_(), timeZone: tz,
     sheetUrl: store.ss.getUrl(), folderUrl: store.folder.getUrl(),
+    listener: getListenerStateNoLock_(),
     generated: new Date().toISOString()
   };
 }

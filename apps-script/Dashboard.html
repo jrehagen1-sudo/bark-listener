@@ -20,6 +20,12 @@
   .status{font-size:13px;color:var(--muted);margin-left:auto;display:flex;align-items:center;gap:6px}
   .dot{width:9px;height:9px;border-radius:50%;background:#aaa}
   .dot.on{background:var(--ok)}
+  .dot.warn{background:#d29922}
+  .lshead{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .lshead h2{margin:0}
+  .lshead button{margin-left:auto}
+  #lsState{margin-top:8px;font-size:15px;display:flex;align-items:center;gap:8px}
+  #lsInfo,#lsCmd{margin-top:4px}
   .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:14px}
   .kpi{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px}
   .kpi b{display:block;font-size:24px;color:var(--accent);line-height:1.2}
@@ -88,6 +94,13 @@
     <button id="refresh">Refresh</button>
     <button id="pdfBtn" class="primary">Download PDF report</button>
     <span class="status"><span class="dot" id="liveDot"></span><span id="liveTxt">Checking listener…</span></span>
+  </div>
+
+  <div class="card" id="lsCard">
+    <div class="lshead"><h2>Phone listener</h2><button id="lsRestart">Restart listener</button></div>
+    <div id="lsState"><span class="dot" id="lsDot"></span><span id="lsTxt">Loading…</span></div>
+    <div id="lsInfo" class="muted"></div>
+    <div id="lsCmd" class="muted"></div>
   </div>
 
   <div class="kpis" id="kpis"></div>
@@ -450,12 +463,71 @@
       : 'Listener offline · last seen ' + new Date(last.t).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
   }
 
+  /* ---------------------------------------------- phone listener status + remote restart */
+  const LS_STATES = {
+    listening: 'Listening', barking: 'Listening · barking right now', starting: 'Starting up',
+    'needs-tap': 'Needs one tap on the phone screen to start the microphone',
+    stopped: 'Page open but not listening (Restart will start it)'
+  };
+  const ago = (ms) => { const m = Math.round(ms / 60000); return m < 1 ? 'just now' : m < 90 ? m + ' min ago' : Math.round(m / 60) + ' h ago'; };
+  const clock = (t) => new Date(t).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+  function showListener(ls) {
+    if (!ls) return;
+    const st = ls.status, cmd = ls.command, now = ls.now || Date.now();
+    if (!st) {
+      $('lsDot').className = 'dot';
+      $('lsTxt').textContent = 'The phone has not checked in yet. It starts once the updated Listener page is open on it.';
+      $('lsInfo').textContent = '';
+    } else {
+      const age = now - st.receivedAt;
+      const online = age < 3 * 60000;
+      $('lsDot').className = 'dot' + (!online ? '' : st.state === 'listening' || st.state === 'barking' ? ' on' : ' warn');
+      $('lsTxt').textContent = online
+        ? (LS_STATES[st.state] || st.state) + ' · checked in ' + ago(age)
+        : 'No check-in for ' + ago(age).replace(' ago', '') + '. The page is closed or the phone is asleep, so a restart will wait for it.';
+      const bits = [];
+      if (st.battery != null) bits.push('Battery ' + st.battery + '%' + (st.charging ? ' charging' : ' NOT charging'));
+      bits.push(st.visible ? 'screen on' : 'screen off / page in background');
+      if (st.mic) bits.push('mic ' + (st.mic === 'granted' ? 'allowed' : st.mic));
+      if (st.listeningSince) bits.push('listening since ' + clock(st.listeningSince));
+      if (st.restarts15m) bits.push(st.restarts15m + ' restart(s) in the last 15 min');
+      if (st.lastError) bits.push('last error: ' + st.lastError);
+      if (st.prevAliveAt && st.pageSince && st.pageSince - st.prevAliveAt > 10 * 60000) bits.push('page reloaded ' + clock(st.pageSince) + ' after a gap since ' + clock(st.prevAliveAt));
+      $('lsInfo').textContent = bits.join(' · ');
+    }
+    if (cmd) {
+      $('lsCmd').textContent = cmd.doneAt
+        ? 'Last restart: ' + clock(cmd.doneAt) + ', ' + cmd.result
+        : cmd.pickedAt ? 'Restart sent ' + ago(now - cmd.at) + '. The phone picked it up and is restarting…'
+        : 'Restart sent ' + ago(now - cmd.at) + '. Waiting for the phone (it checks in about once a minute).';
+    }
+  }
+  let lsPoll = null;
+  function pollListener(times) {
+    clearTimeout(lsPoll);
+    if (times <= 0) return;
+    lsPoll = setTimeout(async () => {
+      try {
+        const ls = await run('getListenerState', API_KEY);
+        showListener(ls);
+        if (ls.command && ls.command.doneAt) { load(); return; }
+      } catch (e) {}
+      pollListener(times - 1);
+    }, 10000);
+  }
+  $('lsRestart').onclick = async () => {
+    $('lsRestart').disabled = true;
+    try { showListener(await run('sendListenerCommand', API_KEY, 'restart')); pollListener(30); }
+    catch (e) { $('lsCmd').textContent = 'Could not send: ' + (e.message || e); }
+    finally { setTimeout(() => { $('lsRestart').disabled = false; }, 5000); }
+  };
+
   async function load() {
     $('refresh').disabled = true;
     try {
       data = await run('getDashboardData', API_KEY);
       DETAILS.forEach(k => { $(k).value = data.settings[k]; });
-      render(); renderTimeline(); showLive(); updateListenerLink();
+      render(); renderTimeline(); showLive(); updateListenerLink(); showListener(data.listener);
     } catch (e) {
       $('findings').innerHTML = '<li>Could not load data: ' + esc(e.message || e) + '</li>';
     } finally { $('refresh').disabled = false; }
