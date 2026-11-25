@@ -1,0 +1,12 @@
+# Cloudflare serves only the Listener page (index.html). Everything else stays private.
+.git
+.github
+.gitignore
+.assetsignore
+.wrangler
+node_modules
+apps-script
+README.md
+wrangler.jsonc
+.clasp.json
+.clasprc.json
